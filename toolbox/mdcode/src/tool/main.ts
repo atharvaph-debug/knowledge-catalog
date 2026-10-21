@@ -22,6 +22,9 @@ cli.command('init', 'Initialize a new catalog snapshot')
         '--semantic-model <id>',
         'Semantic model scope as <projectId>.<locationId>.<entryGroupId>')
     .option('--pull', 'Optionally pull catalog entries during initialization')
+    .option(
+        '--format <format>',
+        'On-disk format. Only `okf` is accepted; omit for the default layout')
     .action(async (options) => {
       let exitCode = 1;
       try {
@@ -42,6 +45,9 @@ cli.command('pull', 'Pull catalog entries')
     .option(
         '--force-remove',
         'Delete a differently-named local model and replace it with the catalog\'s; without it, a pull that would leave two models in the entry group fails. Also deletes a local profile file the catalog\'s stored copies do not include (semantic-model scope)')
+    .option(
+        '--format <format>',
+        'On-disk format. Only `okf` is accepted; omit for the default layout')
     .action(async (options) => {
       let exitCode = 1;
       try {
@@ -81,6 +87,9 @@ cli.command('push', 'Push catalog entries')
     .option(
         '--all-profiles',
         'Deploy the graph for every defined binding profile (plus the inline bindings when the document declares a target); Knowledge Catalog still records the default binding; mutually exclusive with --profile and --no-profile; semantic-model push only')
+    .option(
+        '--format <format>',
+        'On-disk format. Only `okf` is accepted; omit for the default layout')
     .action(async (options) => {
       let exitCode = 1;
       try {
