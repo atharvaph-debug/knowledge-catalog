@@ -149,10 +149,15 @@ export class CatalogClient extends api.ApiClient {
   }
 
   async lookupEntry(project: string, location: string, name: string,
-                    aspects?: string[]): Promise<api.ApiResult<Entry>> {
+                    aspects?: string[],
+                    allAspects = false): Promise<api.ApiResult<Entry>> {
     const container = `${catalogContainer(project, location)}:lookupEntry`;
     const params: Record<string, any> = { entry: name, view: 'BASIC' };
-    if (aspects && aspects.length) {
+    // ALL needs no aspect-type list, so it reaches aspects whose type the
+    // caller cannot read -- CUSTOM would require naming them.
+    if (allAspects) {
+      params.view = 'ALL';
+    } else if (aspects && aspects.length) {
       params.view = 'CUSTOM';
       params.aspectTypes = aspects;
     }
