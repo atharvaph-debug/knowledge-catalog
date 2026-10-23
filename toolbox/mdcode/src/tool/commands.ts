@@ -12,6 +12,7 @@ import * as context from '../libts/gcp/context';
 import * as dataplex from '../libts/gcp/dataplex';
 import {SpannerClient} from '../libts/gcp/spanner';
 import {fileNameOf, SemanticModelLayout} from '../libts/layouts/semantic-model';
+import {SplitLayout} from '../libts/layouts/split';
 import {BUNDLE_DIR, CATALOG_DIR} from '../libts/okf/bundle';
 import {catalogToOkf} from '../libts/okf/catalog_to_okf';
 import {initOkfWorkspace} from '../libts/okf/init_okf_workspace';
@@ -416,6 +417,18 @@ export async function pull(options: PullOptions = {}): Promise<number> {
 
   if (snapshot.manifest.source.type === Sources.SEMANTIC_MODEL) {
     return await pullSemanticModel(ctx, snapshot, options);
+  }
+
+  // A context set is both halves, each pulled by the leg that owns it: the
+  // model by the semantic leg, the rest into the OKF bundle. The source
+  // leaves the model's entries out of what the bundle enumerates, so the two
+  // legs cannot write the same entry.
+  if (snapshot.manifest.source.type === Sources.CONTEXT_SET) {
+    const split = snapshot.layout as SplitLayout;
+    const modelExit =
+        await pullSemanticModel(ctx, snapshot, options, split.semantic);
+    if (modelExit !== 0) return modelExit;
+    return await catalogToOkf(ctx, snapshot, {dryRun: options.dryRun});
   }
 
   const catalog = new dataplex.CatalogClient(ctx);
@@ -1039,11 +1052,18 @@ export async function push(options: PushOptions): Promise<number> {
     return await okfToCatalog(ctx, snapshot, {validateOnly: options.validateOnly});
   }
 
-  if (snapshot.manifest.source.type === Sources.SEMANTIC_MODEL) {
+  // A context set pushes its model exactly as a semantic-model scope does,
+  // then its OKF bundle.
+  const contextSet = snapshot.manifest.source.type === Sources.CONTEXT_SET;
+  if (snapshot.manifest.source.type === Sources.SEMANTIC_MODEL || contextSet) {
     // The semantic-model source always resolves to the SemanticModel layout
-    // (see createLayout), so this cast is safe.
-    const layout = snapshot.layout as SemanticModelLayout;
-    const source = snapshot.manifest.source as SemanticModelSource;
+    // (see createLayout), so this cast is safe; a context set keeps one as
+    // half of its split layout, and its source carries the same project,
+    // location and entryGroup.
+    const layout = contextSet ? (snapshot.layout as SplitLayout).semantic :
+                                snapshot.layout as SemanticModelLayout;
+    const source =
+        snapshot.manifest.source as unknown as SemanticModelSource;
 
     // The push has two axes. The profile axis says how many binding profiles
     // the graph deploys for: --no-profile (options.profile === false) deploys
@@ -1459,6 +1479,15 @@ export async function push(options: PushOptions): Promise<number> {
           'so there is no graph to deploy; give the model a deployment target, ' +
           'or drop --no-kc to publish it to Knowledge Catalog.');
       return 1;
+    }
+    // The model is published; now the rest of the context set. This is the
+    // only way out of this branch that is not a failure, so reaching it means
+    // the model leg passed its checks. Running it first is deliberate: those
+    // checks can reject the whole command, and failing before the bundle's
+    // batches go out leaves less half-applied.
+    if (contextSet) {
+      return await okfToCatalog(
+          ctx, snapshot, {validateOnly: options.validateOnly});
     }
     return 0;
   }
@@ -1977,12 +2006,17 @@ async function pushKnowledgeCatalog(
 // the catalog holds file copies of the model and profile files, pull writes
 // those instead of the model rebuilt from the aspects.
 // Returns a process exit code (0 on success).
+// `modelLayout` is the layout holding the model file. A semantic-model scope
+// resolves to one directly (see createLayout); a context set keeps it as one
+// half of its split layout and passes that half in.
 async function pullSemanticModel(
     ctx: context.ApiContext, snapshot: kcmd.CatalogSnapshot,
-    options: PullOptions): Promise<number> {
+    options: PullOptions,
+    modelLayout?: SemanticModelLayout): Promise<number> {
   // The semantic-model source always resolves to the SemanticModel layout
-  // (see createLayout), so these casts are safe.
-  const layout = snapshot.layout as SemanticModelLayout;
+  // (see createLayout), so these casts are safe. A SplitSource carries the
+  // same project, location and entryGroup.
+  const layout = modelLayout ?? snapshot.layout as SemanticModelLayout;
   const source = snapshot.manifest.source as SemanticModelSource;
 
   console.log(
