@@ -6,15 +6,19 @@ import * as path from 'node:path';
 import * as md from './metadata';
 import { StandardLayout } from './layouts/standard';
 import { DocumentsLayout } from './layouts/documents';
+import { OkfLayout } from './layouts/okf';
 import { SemanticModelLayout } from './layouts/semantic-model';
-import { CATALOG_DIR } from './okf/bundle';
+import { SplitLayout } from './layouts/split';
+import { BUNDLE_DIR, CATALOG_DIR } from './okf/bundle';
 import type { CatalogSource } from './source';
 import type { SemanticModelSource } from './sources/semantic-model';
+import type { SplitSource } from './sources/split';
 
 export enum Layouts {
   STANDARD = 'standard',
   DOCUMENTS = 'documents',
-  SEMANTIC_MODEL = 'semantic-model'
+  SEMANTIC_MODEL = 'semantic-model',
+  SPLIT = 'split'
 }
 
 
@@ -54,6 +58,16 @@ export function createLayout(source: CatalogSource,
       // Only a SemanticModelSource declares this layout.
       const {project, location, entryGroup} = source as SemanticModelSource;
       return new SemanticModelLayout(catalogPath, entryGroup, {project, location});
+    }
+    case Layouts.SPLIT: {
+      // Only a SplitSource declares this layout. Its two halves sit in
+      // different folders: the model where a semantic-model workspace keeps
+      // it, the bundle beside it so that bundle/ on its own is portable OKF.
+      const split = source as SplitSource;
+      return new SplitLayout(
+          new SemanticModelLayout(catalogPath, split.entryGroup,
+                                  {project: split.project, location: split.location}),
+          new OkfLayout(path.join(basePath, BUNDLE_DIR), split.groupName));
     }
     default:
       throw new Error(`Unknown layout type: ${source.layout}`);

@@ -12,9 +12,11 @@ import * as context from '../libts/gcp/context';
 import * as dataplex from '../libts/gcp/dataplex';
 import {SpannerClient} from '../libts/gcp/spanner';
 import {fileNameOf, SemanticModelLayout} from '../libts/layouts/semantic-model';
+import {BUNDLE_DIR, CATALOG_DIR} from '../libts/okf/bundle';
 import {catalogToOkf} from '../libts/okf/catalog_to_okf';
 import {initOkfWorkspace} from '../libts/okf/init_okf_workspace';
 import {okfToCatalog} from '../libts/okf/okf_to_catalog';
+import {SplitSource} from '../libts/sources/split';
 import {convertOwlToOsi} from '../libts/semantic/converters/owl/convert';
 import * as deploy from '../libts/semantic/deploy_bigquery';
 import * as kc from '../libts/semantic/deploy_knowledge_catalog';
@@ -60,6 +62,8 @@ export interface InitOptions {
   bigqueryDataset?: string|string[];
   kb?: string;
   semanticModel?: string;
+  // A context set: its semantic model in OSI+G and the rest in OKF.
+  contextSet?: string;
   pull?: boolean;
 }
 
@@ -262,6 +266,52 @@ function pruningDialect(model: SemanticModel): string|undefined {
 }
 
 
+// Provisions the Knowledge Catalog destination a locally-authored semantic
+// model pushes into, and creates the folder its model file lives in. Both the
+// semantic-model and the context-set scope hold a model, so both need this.
+// Returns an exit code when it fails, or undefined.
+async function provisionModelDestination(
+    ctx: context.ApiContext,
+    source: {project: string, location: string, entryGroup: string, name: string}):
+    Promise<number|undefined> {
+  // Provision the destination entry group now, at init, so push writes only
+  // entries -- matching how the standard layout operates (its push creates
+  // entries, never the entry group). Idempotent: an already-existing group
+  // (409) is success.
+  const catalog = new dataplex.CatalogClient(ctx);
+  const res = await catalog.createEntryGroup(
+      source.project, source.location, source.entryGroup);
+  // A caller without create permission may be refused the create of an
+  // entry group that exists. A lookup tells the two apart.
+  const exists = res.status === 409 ||
+      (res.status === 403 &&
+       (await catalog.getEntryGroup(
+            source.project, source.location, source.entryGroup))
+               .status === 200);
+  if (res.status !== 200 && !exists) {
+    console.error(
+        `Error: failed to create entry group '${source.name}': ` +
+        `${res.message || res.status}`);
+    return 1;
+  }
+  // A few constructs have no built-in system type, so the entry and aspect
+  // types they need are provisioned here too. Everything else the push
+  // writes references types that already exist under `dataplex-types`.
+  // kc_custom_types.ts is the list of what is custom.
+  const provisioned = await provisionCustomTypes(catalog, source);
+  for (const w of provisioned.warnings ?? []) console.warn(`Warning: ${w}`);
+  if (provisioned.error) {
+    console.error(`Error: ${provisioned.error}`);
+    return 1;
+  }
+  if (provisioned.denied) console.warn(`Warning: ${provisioned.denied}`);
+  fs.mkdirSync(
+      path.join(CATALOG_DIR, 'EntryGroups', source.entryGroup),
+      {recursive: true});
+  return undefined;
+}
+
+
 export async function init(options: InitOptions): Promise<number> {
   const okf = okfSelected(options, 'init');
 
@@ -285,44 +335,22 @@ export async function init(options: InitOptions): Promise<number> {
   } else if (options.semanticModel) {
     manifest = await kcmd.CatalogManifest.initWithSemanticModel(
         options.semanticModel, ctx);
-    const source = manifest.source as SemanticModelSource;
-    // Provision the destination entry group now, at init, so push writes only
-    // entries -- matching how the standard layout operates (its push creates
-    // entries, never the entry group). Idempotent: an already-existing group
-    // (409) is success.
-    const catalog = new dataplex.CatalogClient(ctx);
-    const res = await catalog.createEntryGroup(
-        source.project, source.location, source.entryGroup);
-    // A caller without create permission may be refused the create of an
-    // entry group that exists. A lookup tells the two apart.
-    const exists = res.status === 409 ||
-        (res.status === 403 &&
-         (await catalog.getEntryGroup(
-              source.project, source.location, source.entryGroup))
-                 .status === 200);
-    if (res.status !== 200 && !exists) {
-      console.error(
-          `Error: failed to create entry group '${source.name}': ` +
-          `${res.message || res.status}`);
-      return 1;
-    }
-    // A few constructs have no built-in system type, so the entry and aspect
-    // types they need are provisioned here too. Everything else the push
-    // writes references types that already exist under `dataplex-types`.
-    // kc_custom_types.ts is the list of what is custom.
-    const provisioned = await provisionCustomTypes(catalog, source);
-    for (const w of provisioned.warnings ?? []) console.warn(`Warning: ${w}`);
-    if (provisioned.error) {
-      console.error(`Error: ${provisioned.error}`);
-      return 1;
-    }
-    if (provisioned.denied) console.warn(`Warning: ${provisioned.denied}`);
-    fs.mkdirSync(
-        path.join('catalog', 'EntryGroups', source.entryGroup),
-        {recursive: true});
+    const failed = await provisionModelDestination(
+        ctx, manifest.source as SemanticModelSource);
+    if (failed !== undefined) return failed;
+  } else if (options.contextSet) {
+    manifest =
+        await kcmd.CatalogManifest.initWithContextSet(options.contextSet, ctx);
+    const source = manifest.source as SplitSource;
+    const failed = await provisionModelDestination(ctx, source);
+    if (failed !== undefined) return failed;
+    // The OKF half sits beside catalog/, not inside it, so that bundle/ on
+    // its own is a portable OKF bundle.
+    fs.mkdirSync(BUNDLE_DIR, {recursive: true});
   } else {
     console.error(
-        'Error: Must provide --entry-group, --bigquery-dataset, --kb, or --semantic-model');
+        'Error: Must provide --entry-group, --bigquery-dataset, --kb, ' +
+        '--semantic-model, or --context-set');
     return 1;
   }
 
