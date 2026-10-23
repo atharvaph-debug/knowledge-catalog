@@ -23,6 +23,7 @@ import {SemanticModelLayout} from './semantic-model';
 export class SplitLayout implements CatalogLayout {
   private readonly _semantic: SemanticModelLayout;
   private readonly _okf: OkfLayout;
+  private _warned = false;
 
   constructor(semantic: SemanticModelLayout, okf: OkfLayout) {
     this._semantic = semantic;
@@ -39,24 +40,34 @@ export class SplitLayout implements CatalogLayout {
     return this._okf;
   }
 
+  // Only indexes the two halves. Reading the semantic half's entries parses
+  // the model file, which needs the SQL parser, and `pull` and `push` open
+  // the workspace before they load it -- so nothing here may ask either half
+  // what entries it has.
   async init(): Promise<void> {
     await this._semantic.init();
     await this._okf.init();
+  }
 
-    // Both halves name entries in one entry group, so a concept named for a
-    // model element is two local writers for one server object. Reads take
-    // the semantic one, which would otherwise shadow the concept silently --
-    // and silent shadowing is how a concept goes missing from a push.
+  // Both halves name entries in one entry group, so a concept named for a
+  // model element is two local writers for one server object. Reads take the
+  // semantic one, which would otherwise shadow the concept silently -- and
+  // silent shadowing is how a concept goes missing from a push. Warned once,
+  // from listEntries, which is the cheapest point that has already paid for
+  // the model file to be read.
+  private _warnCollisionsOnce(): void {
+    if (this._warned) return;
+    this._warned = true;
+
     const collisions = this._okf.listEntries().filter(
         name => this._semantic.entryExists(name));
-    if (collisions.length) {
-      console.warn(
-          `Warning: ${collisions.length} entr${
-              collisions.length === 1 ? 'y is' : 'ies are'} in both halves of ` +
-          `this workspace: ${collisions.join(', ')}. The semantic model's ` +
-          `copy is the one that is read. Remove the concept from bundle/ or ` +
-          `rename the model element.`);
-    }
+    if (!collisions.length) return;
+    console.warn(
+        `Warning: ${collisions.length} entr${
+            collisions.length === 1 ? 'y is' : 'ies are'} in both halves of ` +
+        `this workspace: ${collisions.join(', ')}. The semantic model's ` +
+        `copy is the one that is read. Remove the concept from bundle/ or ` +
+        `rename the model element.`);
   }
 
   entryExists(name: string): boolean {
@@ -68,6 +79,7 @@ export class SplitLayout implements CatalogLayout {
   // is meaningful; then the bundle's. A collision is listed once, under the
   // half that a read would reach.
   listEntries(): string[] {
+    this._warnCollisionsOnce();
     const names = this._semantic.listEntries();
     const seen = new Set(names);
     for (const name of this._okf.listEntries()) {

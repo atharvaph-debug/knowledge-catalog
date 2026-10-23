@@ -245,13 +245,18 @@ describe('deleting', () => {
 });
 
 describe('collisions', () => {
-  test('init warns, and a read takes the model\'s copy', async () => {
+  test('listing warns, and a read takes the model\'s copy', async () => {
     writeModel();
     writeConcept('commerce.entities.orders', 'The concept copy');
     const warn = spyOn(console, 'warn').mockImplementation(() => {});
 
     try {
       const l = await layout();
+      // Opening the workspace says nothing: that would read the model file,
+      // which pull and push cannot afford before they load the SQL parser.
+      expect(warn).not.toHaveBeenCalled();
+
+      l.listEntries();
       expect(warn).toHaveBeenCalled();
       expect(String(warn.mock.calls[0][0]))
           .toContain('commerce.entities.orders');
@@ -271,8 +276,22 @@ describe('collisions', () => {
     writeConcept('policies/revenue');
     const warn = spyOn(console, 'warn').mockImplementation(() => {});
     try {
-      await layout();
+      (await layout()).listEntries();
       expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test('warns once, however many times the entries are listed', async () => {
+    writeModel();
+    writeConcept('commerce.entities.orders');
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const l = await layout();
+      l.listEntries();
+      l.listEntries();
+      expect(warn).toHaveBeenCalledTimes(1);
     } finally {
       warn.mockRestore();
     }
