@@ -26,8 +26,9 @@ export class CatalogSnapshot {
     this.basePath = basePath;
     this.manifest = manifest;
 
-    const catalogPath = path.join(this.basePath, 'catalog');
-    this._layout = createLayout(manifest.source, catalogPath);
+    // The workspace root, not the catalog folder: each layout roots itself
+    // under it, and a split workspace roots two layouts in different folders.
+    this._layout = createLayout(manifest.source, this.basePath);
   }
 
   static async fromPath(basePath: string, ctx: gcp.ApiContext): Promise<CatalogSnapshot> {

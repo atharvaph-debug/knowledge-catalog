@@ -7,12 +7,10 @@ import * as path from 'node:path';
 import * as gcp from '../gcp';
 import * as dataplex from '../gcp/dataplex';
 import * as kcmd from '../index';
+import {BUNDLE_DIR} from './bundle';
 import {assertResidueOnly, buildResidue, OVERVIEW_ASPECT_KEY, typeFacetKey} from './catalog_residue';
 import {Concept, conceptToFileContent, RESIDUE_KEY} from './concept';
 import {splitOkfMetadata} from './okf_metadata';
-
-/** Beside catalog.yaml, never inside it, so the bundle stays portable OKF. */
-const BUNDLE_DIR = 'bundle';
 
 /** Options forwarded from `kcmd pull`. */
 export interface CatalogToOkfOptions {

@@ -1,10 +1,13 @@
 // Defines the Catalog metadata layout abstraction.
 //
 
+import * as path from 'node:path';
+
 import * as md from './metadata';
 import { StandardLayout } from './layouts/standard';
 import { DocumentsLayout } from './layouts/documents';
 import { SemanticModelLayout } from './layouts/semantic-model';
+import { CATALOG_DIR } from './okf/bundle';
 import type { CatalogSource } from './source';
 import type { SemanticModelSource } from './sources/semantic-model';
 
@@ -35,9 +38,13 @@ export interface CatalogLayout {
 }
 
 
-// The layout a source's workspace uses, rooted at `catalogPath`.
+// The layout a source's workspace uses, for a workspace rooted at `basePath`.
+// Each layout names the folder it keeps its files in, so that a layout which
+// uses more than one folder can say so here rather than deriving a second one
+// from the first.
 export function createLayout(source: CatalogSource,
-                             catalogPath: string): CatalogLayout {
+                             basePath: string): CatalogLayout {
+  const catalogPath = path.join(basePath, CATALOG_DIR);
   switch (source.layout) {
     case Layouts.STANDARD:
       return new StandardLayout(catalogPath);
