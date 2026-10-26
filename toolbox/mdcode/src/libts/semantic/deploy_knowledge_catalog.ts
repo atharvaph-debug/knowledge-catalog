@@ -22,20 +22,24 @@
 //     and that each file copy fits in one aspect, snapshots the destination
 //     entry group to guard against foreign models (unless `--force-remove` is
 //     set), and checks that any required custom entry/aspect types exist in
-//     the target project.
+//     the target project. With the second-generation aspects, it also checks
+//     every aspect's size and each entry's instance count per aspect type.
 //   * Apply creates or updates each model's entries in dependency order: the
 //     `semantic-model` anchor first, then independent child entries
 //     concurrently, and finally dependent child entries (`semantic-metric` and
 //     `semantic-explore`).
-//   * Relationship edges are published as `schema-join` entry links between
-//     the two entity entries, under both layouts, after that model's entries
-//     exist. Reconciliation also recognizes `semantic-relationship` links. A
-//     re-push first deletes any orphaned relationship links (no longer
-//     emitted) and stale links (whose type or endpoint references changed),
-//     then creates new or recreated links and updates unchanged links' aspects
-//     in place. The caller additionally needs
-//     `dataplex.entryGroups.useSchemaJoinEntryLink` and `useSchemaJoinAspect`
-//     on the destination entry group.
+//   * Relationship edges are published as entry links between two entity
+//     entries after that model's entries exist: a `schema-join` link per
+//     relationship, or with v2Aspects a `semantic-link` per ordered entity
+//     pair, a `reference` link from each relationship entry to each of its
+//     entities, and one from each entity to each parent it extends. A re-push
+//     first deletes any orphaned links (no longer emitted) and stale links
+//     (whose type or endpoint references changed), then creates new or
+//     recreated links and updates unchanged links' aspects in place. The
+//     caller additionally needs
+//     `dataplex.entryGroups.useSchemaJoinEntryLink` and `useSchemaJoinAspect`,
+//     and with v2Aspects `useReferenceEntryLink`, on the destination entry
+//     group.
 //   * Reconcile deletions: after writing, delete any child entry this push owns
 //     (by `ownedPrefixes`) that is present in the pre-write listing but was not
 //     re-emitted.
@@ -47,10 +51,11 @@
 import {ApiResult} from '../gcp/api';
 import * as context from '../gcp/context';
 import * as crm from '../gcp/crm';
-import {CatalogClient, Entry, EntryLink} from '../gcp/dataplex';
+import {Aspect, CatalogClient, Entry, EntryLink} from '../gcp/dataplex';
+import type {OverviewSidecar} from '../layouts/semantic-model';
 
 import {collectCustomTypes, customTypeHome, FILE_COPY_TYPE_ID, FileCopy, PUSH_ID_LABEL} from './kc_custom_types';
-import {anchorId, collectEntityNames, collectOwnedEntries, collectOwnedReferences, entryAspectKeys, entryId, entryTypeId, isAnchorEntry, isDependentEntry, isEntryOwner, isLinkOwner, isRelationshipLink, KcAnchor, linkId, linkTypeId, sameLinkReferences,} from './kc_entries';
+import {anchorId, collectEntityNames, collectOwnedEntries, collectOwnedReferences, entryAspectKeys, entryId, entryTypeId, isAnchorEntry, isDependentEntry, isEntryOwner, isLinkOwner, isModelLink, KcAnchor, linkId, linkTypeId, sameLinkReferences,} from './kc_entries';
 import {entryIdOf, slug} from './kc_ids';
 import * as kcEmit from './knowledge_catalog';
 import {LoadedModel} from './loader';
@@ -77,15 +82,13 @@ export interface KcDeployOptions {
   emitExpressions?: boolean;
   // Emit the second-generation built-in aspect fields and entry-id layout
   // (selected via KC_V2_ASPECTS=1). Off by default (absent means false).
-  // Consumed by `emitModels` when called through `preflightKnowledgeCatalog` or
-  // `deployKnowledgeCatalog`, and by `updateEntry` when computing `aspectKeys`
-  // (including when called through `deployEmittedModels`, which takes
-  // already-emitted resources from an origin with its own emitter).
   v2Aspects?: boolean;
   // The file copies of the model file and its profile files, which the
-  // emitter stores when v2Aspects is off. Consumed by `emitModels` like
-  // v2Aspects.
+  // emitter stores when v2Aspects is off.
   sourceFiles?: FileCopy[];
+  // The overview sidecar of each entry, by entry id, which the emitter writes
+  // into the entry's overview when v2Aspects is on.
+  overviews?: ReadonlyMap<string, OverviewSidecar>;
   // Set when the caller has already checked that the file-copy type exists
   // in the destination project. The preflight then does not look that type
   // up again. It still looks up every other custom type the model uses.
@@ -126,7 +129,7 @@ export interface KcDeployResult {
   // Entries deleted: those orphaned by removed entities/metrics, plus every
   // entry of a --force-remove'd model (0 for validateOnly).
   deleted: number;
-  // Relationship (schema-join or semantic-relationship) entry links written --
+  // Relationship (schema-join or semantic-link) entry links written --
   // created, updated, or recreated (0 for validateOnly).
   linked: number;
   // Orphaned relationship links deleted -- from relationships dropped or
@@ -194,6 +197,8 @@ function sleep(ms: number): Promise<void> {
  *      `opts.fileCopyTypeChecked` is set.
  *   5. Returns the emitted resources, entry-group listing, warnings, and plan
  *      as `prepared` for `applyKnowledgeCatalog`.
+ * With `opts.v2Aspects` set, step 2 also checks every aspect's size and each
+ * entry's instance count per aspect type.
  */
 export async function preflightKnowledgeCatalog(
     models: LoadedModel[], ctx: context.ApiContext, opts: KcDeployOptions):
@@ -319,9 +324,10 @@ export async function deployEmittedModels(
  * Runs read-only preflight checks on already-emitted models.
  *
  * The method performs the following checks:
- *   1. Validates locally that `emitted` contains a single model and that each
- *      file copy fits in one aspect, builds the dry-run plan, and returns
- *      early when `opts.validateOnly` is set.
+ *   1. Validates locally that `emitted` contains a single model, that each
+ *      file copy fits in one aspect and, with `opts.v2Aspects` set, that every
+ *      aspect size and instance count is within its limit. Builds the
+ *      dry-run plan and returns early when `opts.validateOnly` is set.
  *   2. Lists the destination entry group and validates that it contains no
  *      foreign models unless `--force-remove` is set.
  *   3. Validates that every custom type used by the model exists in the
@@ -351,6 +357,8 @@ async function preflightEmittedModels(
   const model = emitted[0];
   const sizeValidation = validateFileCopySizes(model, result);
   if (!sizeValidation.success) return {result: sizeValidation};
+  const aspectsError = opts.v2Aspects ? emittedAspectsError(model) : undefined;
+  if (aspectsError) return {result: result(false, aspectsError)};
   plan = buildPlan(emitted, opts);
   if (opts.validateOnly) return {result: result(true)};
 
@@ -453,6 +461,7 @@ function validateEntryGroup(
 // The largest aspect data Dataplex accepts: 120 KiB of its JSON form, in UTF-8
 // bytes, with escaping counted. The schema aspect may hold 2 MiB.
 export const MAX_ASPECT_DATA_BYTES = 120 * 1024;
+const MAX_SCHEMA_ASPECT_DATA_BYTES = 2 * 1024 * 1024;
 
 /**
  * Validates that every file copy in `model` fits in one aspect.
@@ -505,6 +514,96 @@ function fileCopySizeError(data: Record<string, any>): string|undefined {
   return `file '${data.fileName}' is too large to store in Knowledge ` +
       `Catalog: its copy takes ${bytes} bytes, and one aspect holds at most ` +
       `${MAX_ASPECT_DATA_BYTES}.`;
+}
+
+/**
+ * The emitter's warnings for `models` with v2Aspects on, and why push's
+ * catalog leg cannot write them: an emit error, an aspect too large to
+ * store, or an entry with too many instances of one aspect type. Calls no
+ * service.
+ */
+export function checkCatalogAspects(
+    models: LoadedModel[],
+    opts: KcDeployOptions): {error?: string; warnings: string[]} {
+  const emit = emitModels(models, opts);
+  const error =
+      emit.error ?? emit.emitted.map(emittedAspectsError).find(e => e);
+  return {error, warnings: emit.warnings};
+}
+
+// Why push cannot write what `model` emits, or undefined when it can.
+function emittedAspectsError(model: EmittedModel): string|undefined {
+  for (const entry of model.resources.entries) {
+    const error = aspectDataError(entry.aspects, `entry '${entryId(entry)}'`) ??
+        instanceCountError(entry);
+    if (error) return error;
+  }
+  for (const link of model.resources.entryLinks) {
+    const error = aspectDataError(link.aspects, `entry link '${linkId(link)}'`);
+    if (error) return error;
+  }
+  return undefined;
+}
+
+// Most aspects Dataplex returns for one entry in one read.
+export const MAX_ASPECTS_PER_READ = 100;
+
+// The aspect types a field can carry at its path, each with what fills it.
+const FIELD_ASPECT_CONTENT: Record<string, string> = {
+  overview: 'examples',
+  guidelines: 'instructions or custom ai_context members',
+  'semantic-extensions': 'custom_extensions from vendors other than GOOGLE',
+};
+
+// Why kcmd could not read back every instance of one aspect type `entry`
+// carries, or undefined when it could. The limit holds per type because pull
+// reads an entry again once per aspect type when one read returns 100.
+function instanceCountError(entry: Entry): string|undefined {
+  for (const [type, content] of Object.entries(FIELD_ASPECT_CONTENT)) {
+    const count = Object.keys(entry.aspects ?? {})
+                      .filter(key => aspectTypeIdOfKey(key) === type)
+                      .length;
+    if (count < MAX_ASPECTS_PER_READ) continue;
+    return `entry '${entryId(entry)}' would hold ${count} ${type} aspects, ` +
+        `and Knowledge Catalog returns at most ${MAX_ASPECTS_PER_READ} in ` +
+        `one read, so kcmd could not read them all back; give ${content} ` +
+        `to fewer than ${MAX_ASPECTS_PER_READ} of the entity and its fields.`;
+  }
+  return undefined;
+}
+
+// Why Knowledge Catalog cannot store one of `aspects`, which `owner` carries,
+// or undefined when each fits.
+function aspectDataError(
+    aspects: Record<string, Aspect>|undefined, owner: string): string|
+    undefined {
+  for (const [key, aspect] of Object.entries(aspects ?? {})) {
+    const type = aspectTypeIdOfKey(key);
+    const bytes = storedJsonBytes(aspect.data ?? {});
+    const limit = type === 'schema' ? MAX_SCHEMA_ASPECT_DATA_BYTES :
+                                      MAX_ASPECT_DATA_BYTES;
+    if (bytes > limit) {
+      return `aspect '${key}' of ${owner} is too large to store in ` +
+          `Knowledge Catalog: its data takes ${bytes} bytes, and one ` +
+          `aspect holds at most ${limit}.`;
+    }
+  }
+  return undefined;
+}
+
+// The UTF-8 bytes of `data`'s JSON as Dataplex counts them. Dataplex writes
+// < > & = ' U+2028 and U+2029 as six-byte \uXXXX escapes.
+function storedJsonBytes(data: unknown): number {
+  const json = JSON.stringify(data);
+  return new TextEncoder().encode(json).length +
+      5 * (json.match(/[<>&=']/g)?.length ?? 0) +
+      3 * (json.match(/[\u2028\u2029]/g)?.length ?? 0);
+}
+
+// The aspect type id in an aspect key, `<project>.<location>.<type>` with an
+// optional `@<path>`.
+function aspectTypeIdOfKey(key: string): string {
+  return key.split('@')[0].split('.').pop() ?? '';
 }
 
 /**
@@ -589,6 +688,7 @@ function emitModels(models: LoadedModel[], opts: KcDeployOptions):
         emitExpressions: opts.emitExpressions,
         v2Aspects: opts.v2Aspects,
         sourceFiles: opts.sourceFiles,
+        overviews: opts.overviews,
       });
     } catch (err: any) {
       return {
@@ -712,6 +812,7 @@ async function writeEmittedModels(
     // Before a link is deleted, read each emitted ID the lookup did not
     // return. A link under one of them that push may not change would fail
     // its write after the delete and leave the relationship with no link.
+    const foundUnchanged = new Set<string>();
     if (orphanedLinks.length || staleLinks.links.length) {
       for (const link of resources.entryLinks) {
         if (existingLinks.has(linkId(link))) continue;
@@ -722,13 +823,17 @@ async function writeEmittedModels(
                              String(err?.message || err).trim()}`,
                        }));
         if (read.error) return {error: `Model '${model}': ${read.error}`};
+        if (read.existing && !isStaleLink(read.existing, link)) {
+          foundUnchanged.add(linkId(link));
+        }
       }
     }
     // `deletedLinks` collects the links deleted so far. An error after a
     // delete gets the push-again hint when a link is missing because of it.
     const deletedLinks: EntryLink[] = [];
-    const hint = (written: ReadonlySet<string> = new Set()) =>
-        restoreHint(deletedLinks, resources.entryLinks, written);
+    const hint = (written: ReadonlySet<string> = new Set()) => restoreHint(
+        deletedLinks, resources.entryLinks,
+        new Set([...staleLinks.current, ...foundUnchanged, ...written]));
     const orphanedLinkDeletions =
         await deleteEntryLinks(cat, opts, orphanedLinks);
     counts.unlinked += orphanedLinkDeletions.deleted.length;
@@ -779,19 +884,17 @@ async function writeEmittedModels(
 /**
  * Returns the push-again hint for an error, or '' when no link is missing.
  *
- * A link is missing when this push deleted a link and did not write the
- * emitted link that takes its place. An emitted link takes the place of a
- * deleted link when it has the same ID or joins the same two entries. A link
- * deleted because its relationship was dropped has no such emitted link, and
- * pushing again does not bring it back.
+ * An emitted link is missing when this push deleted a link with its ID or its
+ * two entries, and `presentIds` does not hold it. `presentIds` holds the IDs
+ * of the links written or found unchanged.
  */
 function restoreHint(
     deletedLinks: readonly EntryLink[], emittedLinks: readonly EntryLink[],
-    writtenIds: ReadonlySet<string>): string {
+    presentIds: ReadonlySet<string>): string {
   const ends = (link: EntryLink) =>
       link.entryReferences.map(r => entryId(r)).sort().join('|');
   const missing = emittedLinks.some(
-      link => !writtenIds.has(linkId(link)) &&
+      link => !presentIds.has(linkId(link)) &&
           deletedLinks.some(
               d => linkId(d) === linkId(link) || ends(d) === ends(link)));
   return missing ? ' (push again to restore the link)' : '';
@@ -894,14 +997,14 @@ interface LinkLookupOutcome {
 }
 
 /**
- * Looks up all relationship entry links in the destination entry group
- * referencing any of `entityNames`.
+ * Looks up all model links in the destination entry group referencing any of
+ * `entityNames`.
  *
  * Links are looked up per referenced entry -- the only server-side access path
  * -- so a link between two of the entities is returned twice and deduplicated
  * here by bare link ID. Queries `lookupEntryLinks` and filters the results to
- * relationship links (`isRelationshipLink`) stored in the destination entry
- * group
+ * the kinds of link push writes (`isModelLink`) stored in the destination
+ * entry group
  * (`projects/<project>/locations/<location>/entryGroups/<entryGroup>/entryLinks/`).
  * `isScopeProject` tells whether a link's project part names the destination
  * project. A link whose project number push cannot resolve is kept.
@@ -927,7 +1030,7 @@ async function lookupEntryLinks(
     for (const link of res.result ?? []) {
       const project = link.name?.match(groupRegExp)?.[1];
       if (!project || (await isScopeProject(project)) === false) continue;
-      if (!isRelationshipLink(link)) continue;
+      if (!isModelLink(link)) continue;
       const id = linkId(link);
       if (!links.has(id)) links.set(id, link);
     }
@@ -1205,8 +1308,8 @@ interface EntriesOutcome {
  * The method writes entries in three stages:
  *   1. Writes the model anchor (`entries[0]`) first, since it is the parent of
  *      every child entry.
- *   2. Writes independent child entries (such as entities, actions, and
- *      constraints) concurrently.
+ *   2. Writes independent child entries (such as entities, relationships,
+ *      actions, and constraints) concurrently.
  *   3. Writes dependent child entries (`semantic-metric` via
  *      `semantic-metric.entity` and, for LookML, `semantic-explore` via
  *      `semantic-explore.baseEntity` / `joins[].fromEntity`, which reference
@@ -1265,15 +1368,15 @@ interface LinksOutcome {
  *
  * Both endpoint entries already exist because `writeEntries` runs first, and
  * any orphaned or stale links the lookup found have already been deleted. On
- * the flag-off path the emitter gives each pair of entries at most one link.
- * A stale link the lookup missed is replaced during these writes, so a link
- * that needs the pair it frees can fail with the duplicate-endpoints error.
- * That error gets the push-again hint, and the next push writes the link. Uses
- * `Promise.allSettled` so a thrown network error on one link waits for any
- * in-flight link writes to finish and reports the link ID in the returned
- * error. `current` holds the emitted IDs whose looked-up link is the model's
- * own with the same type and endpoints. `isScopeProject` tells whether a
- * project part names the destination project.
+ * the flag-off path the emitter gives each pair of entries at most one link,
+ * and with the flag on, each ordered pair. A stale link the lookup missed is
+ * replaced during these writes, so a link that needs the pair it frees can fail
+ * with the duplicate-endpoints error. That error gets the push-again hint, and
+ * the next push writes the link. Uses `Promise.allSettled` so a thrown network
+ * error on one link waits for any in-flight link writes to finish and reports
+ * the link ID in the returned error. `current` holds the emitted IDs whose
+ * looked-up link is the model's own with the same type and endpoints.
+ * `isScopeProject` tells whether a project part names the destination project.
  */
 async function writeEntryLinks(
     cat: CatalogClient, opts: KcDeployOptions, resources: kcEmit.KcResources,
@@ -1363,7 +1466,7 @@ interface ReadLinkOutcome {
  * may change it.
  *
  * Returns the error when the read fails with anything but 404, when the link
- * is not a relationship link, when it references an entry outside the model,
+ * is not of a kind push writes, when it references an entry outside the model,
  * and when push cannot resolve the project number its references need.
  */
 async function readEmittedLink(
@@ -1385,8 +1488,8 @@ async function readEmittedLink(
           `resourcemanager.projects.get on the project`,
     };
   }
-  // Push manages relationship links only, as the lookup does.
-  if (!isRelationshipLink(existing)) {
+  // Push manages only the kinds of link it writes, as the lookup does.
+  if (!isModelLink(existing)) {
     return {
       error: `entry link '${id}' already exists with link type '${
                  linkTypeId(existing)}'; ` +
@@ -1468,13 +1571,15 @@ async function replaceEntryLink(
 }
 
 /**
- * Updates an existing relationship entry link's aspects in place.
+ * Updates an existing entry link's aspects in place. A link with no aspect,
+ * such as a reference link, has nothing to update.
  */
 async function updateEntryLink(
     cat: CatalogClient, link: EntryLink): Promise<ApiResult<EntryLink>> {
+  if (!link.aspects) return {status: 200};
   return cat.updateEntryLink(
       {name: link.name, aspects: link.aspects} as EntryLink,
-      Object.keys(link.aspects ?? {}));
+      Object.keys(link.aspects));
 }
 
 /**
@@ -1533,14 +1638,12 @@ const KEPT_SOURCE_FIELDS =
  * name. Passing `entryAspectKeys(entry, opts)` with `deleteMissingAspects:
  * true` makes a re-push converge: a still-present optional aspect is refreshed,
  * and a removed one (such as `guidelines` when `ai_context.instructions` is
- * deleted, `sql-expressions`, or field-level `guidelines@Schema.<field>`
- * matched by `<project>.<location>.guidelines@*` under `v2Aspects`) is deleted
- * so a later `pull` does not bring it back. Push owns `guidelines` on its own
- * entries -- and, under `v2Aspects`, field-level `guidelines@Schema.<field>` on
- * its entity entries and `sql-expressions` on its entity and metric entries --
- * so it removes any that the model does not declare even if someone added them
- * in the console. Every other aspect another tool attached is left alone,
- * since `aspectKeys` names only the types kcmd writes.
+ * deleted, `sql-expressions`, or a field's instance, matched by its `@*` key
+ * under `v2Aspects`) is deleted so a later `pull` does not bring it back. Push
+ * owns the optional aspects `entryAspectKeys` lists, so it removes any that the
+ * model does not declare even if someone added them in the console. Every other
+ * aspect another tool attached is left alone, since `aspectKeys` names only the
+ * types kcmd writes.
  *
  * The update mask replaces the whole entrySource, so the update carries over
  * fields from `source`, the entrySource the entry had before this push. Of
@@ -1567,13 +1670,6 @@ async function updateEntry(
     ...(Object.keys(labels).length ? {labels} : {}),
   };
   if (Object.keys(merged).length) entry = {...entry, entrySource: merged};
-  // We cannot simply pass `Object.keys(entry.aspects ?? {})` here because
-  // `entry.aspects` only contains the aspects emitted in *this* push. If an
-  // optional aspect (such as `guidelines`, `sql-expressions`, or a column's
-  // `guidelines@Schema.<field>`) was present on a previous push and removed in
-  // this push, it is absent from `entry.aspects` -- and Dataplex only deletes a
-  // removed aspect when its key (or `<project>.<location>.guidelines@*` for
-  // field-level `guidelines`) is still listed in `aspectKeys`.
   const aspectKeys = entryAspectKeys(entry, opts);
   const upd = await cat.updateEntry(
       entry, ['entry_source', 'aspects'], [...aspectKeys],

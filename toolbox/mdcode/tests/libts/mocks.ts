@@ -1,3 +1,5 @@
+import {spyOn} from 'bun:test';
+
 import * as gcp from '../../src/libts/gcp';
 import * as bigquery from '../../src/libts/gcp/bigquery';
 import * as spanner from '../../src/libts/gcp/spanner';
@@ -5,15 +7,41 @@ import * as spanner from '../../src/libts/gcp/spanner';
 // Bypass actual gcloud CLI calls by using the explicit constructor
 export const TEST_API_CONTEXT = new gcp.ApiContext('test-project', 'test-location', 'test-token');
 
+// Stubs the Knowledge Catalog lookup of a Cloud SQL table's entry: it answers
+// `status`, with entry type `type` when that is 200. `mock.restore()` undoes it.
+export function stubCloudSqlEntry(status: number, type?: string) {
+  return spyOn(gcp.CatalogClient.prototype, 'lookupEntry').mockImplementation(async () =>
+      (status === 200 ?
+           {status, result: {entryType: `projects/dataplex-types/locations/global/entryTypes/${type}`}} :
+           {status, message: 'Permission denied (or it may not exist).'}) as any);
+}
+
+// Makes push find each graph's dataset or database, and pass each BigQuery dry
+// run.
+export function passGraphChecks(): void {
+  const ok = (result: object) => ({status: 200, result}) as any;
+  spyOn(bigquery.BigQueryClient.prototype, 'getDataset')
+      .mockResolvedValue(ok({location: 'US'}));
+  spyOn(bigquery.BigQueryClient.prototype, 'query').mockResolvedValue(ok({}));
+  spyOn(spanner.SpannerClient.prototype, 'getDatabase')
+      .mockResolvedValue(ok({}));
+}
+
 
 export class CatalogClientMock extends gcp.CatalogClient {
   public mockEntries: gcp.Entry[] = [];
   public mockEntryGroups: Map<string, gcp.EntryGroup> = new Map();
   public mockEntryTypes: Map<string, gcp.EntryType> = new Map();
   public mockAspectTypes: Map<string, gcp.AspectType> = new Map();
+  // The aspect types the last lookupEntry call asked for.
+  public lookupAspectTypes?: string[];
 
   constructor() {
     super(TEST_API_CONTEXT);
+    // A built-in aspect type every Dataplex project can read, and one of the
+    // aspects `kcmd init` lists by default.
+    this.addMockAspectType(
+        {name: 'projects/dataplex-types/locations/global/aspectTypes/overview'} as gcp.AspectType);
   }
 
   setMockEntries(entries: gcp.Entry[]) {
@@ -70,11 +98,26 @@ export class CatalogClientMock extends gcp.CatalogClient {
   }
 
   async lookupEntry(project: string, location: string, name: string, aspects?: string[]): Promise<gcp.ApiResult<gcp.Entry>> {
+    this.lookupAspectTypes = aspects;
     const entry = this.mockEntries.find(e => e.name == name);
-    if (entry) {
-      return { status: 200, result: entry };
+    if (!entry) {
+      return { status: 404, message: 'Not found' };
     }
-    return { status: 404, message: 'Not found' };
+    // As Dataplex does: only the aspects of the requested types, none when no type is requested.
+    const kept = Object.entries(entry.aspects ?? {})
+        .filter(([, a]) => aspects?.includes(a.aspectType ?? ''));
+    return { status: 200, result: { ...entry, aspects: Object.fromEntries(kept) } };
+  }
+
+  async lookupEntryAspectTypes(project: string, location: string, name: string): Promise<gcp.ApiResult<string[]>> {
+    const entry = this.mockEntries.find(e => e.name == name);
+    if (!entry) {
+      return { status: 404, message: 'Not found' };
+    }
+    // As Dataplex's FULL view does: it lists every aspect key on the entry,
+    // with data or not, so every aspect type appears, each once.
+    const types = Object.keys(entry.aspects ?? {}).map(k => k.split('@')[0]);
+    return { status: 200, result: [...new Set(types)] };
   }
 
   async modifyEntry(project: string, location: string, entry: gcp.Entry, updateMask?: string[], aspectKeys?: string[]): Promise<gcp.ApiResult<gcp.Entry>> {

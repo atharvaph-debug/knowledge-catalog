@@ -23,30 +23,50 @@ existing group is fine) and creates its local directory,
 kcmd push
 ```
 
-With no flags, deploys to every destination — the model's graph backend and
-Knowledge Catalog — the graph first. You do not choose the graph backend: each
+With no flags, deploys to every destination, the model's graph backends and
+Knowledge Catalog, in the order below. You do not choose the graph backend: each
 model deploys to whichever its deployment target names (BigQuery Graph or Spanner
 Graph). The binding profile selects which physical binding feeds the graph, and
 that binding's deployment target selects the backend.
 
 A push has two axes, both defaulted so a bare `kcmd push` deploys the graph for
-the default binding and records to Knowledge Catalog. The **binding-profile axis**
+the default binding and records to Knowledge Catalog, unless it takes the
+two-phase path below. The **binding-profile axis**
 sets how many profiles the graph deploys for; the **Knowledge Catalog axis** is
 whether the catalog leg runs.
 
 | Flag | Effect |
 |------|--------|
-| `--profile <name>` | Deploy the graph for one binding profile (`<model>.profiles/<name>.yaml`); its deployment target selects the backend. Defaults to `default_profile` from `catalog.yaml`, else the model's inline bindings. Mutually exclusive with `--all-profiles` and `--no-profile`. See [Binding profiles](profiles.md). |
+| `--profile <name>` | Deploy the graph for one binding profile (`<model>.profiles/<name>.yaml`); its deployment target selects the backend. Defaults to `default_profile` from `catalog.yaml`, else the model's inline bindings, except on the two-phase path below. Mutually exclusive with `--all-profiles` and `--no-profile`. See [Binding profiles](profiles.md). |
 | `--all-profiles` | Deploy the graph for every defined binding profile (plus the inline bindings when the document itself declares a target), instead of a single one. The Knowledge Catalog leg still records one canonical view — the default binding. Mutually exclusive with `--profile` and `--no-profile`. |
 | `--no-profile` | Deploy the graph for no binding profile: publish only the logical model to Knowledge Catalog, leaving any deployed graph untouched. |
 | `--no-kc` | Skip the Knowledge Catalog metadata push and deploy only the graph the selected profile targets. Knowledge Catalog is pushed by default. A push that deploys no graph (a logical model, or `--no-profile`) can only reach Knowledge Catalog, so `--no-kc` on it is an error, as is `--no-profile --no-kc` (nothing left to deploy). |
+| `--deployment <names>` | Deploy only these entries of the model's `deployments:` list, comma-separated or repeated, in the order given. Push still publishes the model to Knowledge Catalog first. |
+| `--no-deployment` | Publish the model to Knowledge Catalog and deploy nothing, after every check of the two-phase path below. It publishes the model file as written, whereas `--no-profile` publishes the binding `default_profile` names. Push refuses it with `--deployment`, in either order. |
 | `--validate-only` | Run every validation check and report pass/fail, but write nothing. |
 | `--print` | Print each destination's generated artifact (BigQuery or Spanner Graph SQL DDL, Knowledge Catalog entry plan). Combine with `--validate-only` to preview without deploying. |
 | `--force-remove` | Delete models in the entry group that this push no longer includes (see [Updating and removing models](README.md#updating-and-removing-models)). |
 | `--emit-expressions` | Also write the SQL-expression fields (per-field `schema.semantics` and `semantic-metric.expression`) to Knowledge Catalog. Off by default: the published system-type templates do not carry them yet. Knowledge Catalog push only. |
 
-The graph leg deploys first and fails fast, so a rejected model never
-half-deploys.
+A model that lists `deployments:`, and a push with `--deployment` or
+`--no-deployment`, run in two phases. So does a push of a model with a sibling
+profile file, without `--profile`, `--all-profiles` or `--no-profile`. The first
+runs every check, for Knowledge Catalog and for each deployment, and writes
+nothing. The second publishes the model to Knowledge Catalog, then deploys each
+deployment in order with the profile it names. An AlloyDB deployment deploys no
+graph. The first phase dry-runs each BigQuery graph's DDL. Spanner cannot check
+a graph's DDL without running it, so a Spanner deployment whose DDL Spanner
+rejects, for example one that reads a missing column, fails in the second phase,
+after Knowledge Catalog is written. On this path `--no-kc`, `--profile`,
+`--all-profiles` and `--no-profile` are errors, and catalog.yaml's
+`default_profile` chooses no binding: Knowledge Catalog receives the model file
+as written. The runtime still reads `default_profile`, so it must name a
+profile the model declares, and that profile must apply as the runtime
+applies it.
+
+Any other push prepares the catalog's model, checks that it publishes one
+model and checks the file copies before the first graph deploys. Its Knowledge
+Catalog leg runs its own checks only after the graphs deploy.
 
 ### pull
 
@@ -64,7 +84,7 @@ the same scope you authored under. See [Pull](README.md#pull) for behavior.
 | Flag | Effect |
 |------|--------|
 | `--dry-run` | Read the catalog and report what would be written, but write or delete no files. |
-| `--force-remove` | Replace a differently-named local model with the catalog's (see [Pull](README.md#pull)); without it, a pull that would leave the entry group holding two models fails. Also deletes a local profile file the catalog has no copy of, when the catalog holds copies of the model's files. |
+| `--force-remove` | Replace a differently-named local model with the catalog's (see [Pull](README.md#pull)); without it, a pull that would leave the entry group holding two models fails. Also deletes a local profile file the catalog has no copy of, when the catalog holds copies of the model's files. With `KC_V2_ASPECTS=1`, it also deletes a local profile file or overview sidecar the pull did not write. |
 
 ### profiles
 
@@ -74,25 +94,41 @@ kcmd profiles
 
 Reports each binding profile the model declares: its deployment target, the
 source each entity binds to, and what the profile cannot answer or cannot run.
-Under each profile it then prints every error `kcmd push --profile <name>`
+Under each profile it then prints every error push
 would give for it, after a `push rejects:` heading. The inline `default`
 binding is checked too. Beside declared profiles it is listed only when push
 would reject it. Some errors fail every push of the scope, such as a second
 model in the entry group. When push would stop at such an error,
 `kcmd profiles` prints it once above the profiles and still checks each
-profile. When `default_profile` names a profile that a model does not declare,
+profile, unless a plain push runs in two phases. A Cloud SQL table whose entry
+cannot be read stops the command before the report. When
+`default_profile` names a profile that a model does not declare,
 a push that names no profile fails. That error prints above the model's
-profiles.
+profiles. When push warns that the model file's own bindings are incomplete,
+the report prints that warning under `profile 'default'`, unless `--profile`
+names another profile.
 
 The command is read-only. It applies and prunes each profile and generates each
-graph as `push --validate-only` does, but deploys nothing and calls no service,
-so you can compare coverage before choosing one. The checks that need a service
-run only at push time: the BigQuery source table probe, the dry runs of action
-statements and, on a push without `--validate-only`, the Knowledge Catalog
+graph as `push --validate-only` does, but deploys nothing, so you can compare
+coverage before choosing one. Like push, it reads the Knowledge Catalog entry
+of each Cloud SQL table written as its resource name, for the table's dialect.
+The other checks that need a service run only at push time: the BigQuery source table probe, the dry runs of action
+statements and of each BigQuery graph's DDL, the check that a deployment's
+BigQuery dataset or Spanner database exists and, on a push without
+`--validate-only`, the Knowledge Catalog
 checks on the entry group. Push's lookup of the file-copy type also runs only
 at push time, because it calls a service. It exits non-zero when push would
-reject a binding. Until push accepts a deployment that names a profile, the
-report refuses one, while `--print-store` takes that profile's store from it.
+reject a binding. The report checks each profile as
+`kcmd push --profile <name>` does, unless a plain `kcmd push` of the scope
+runs in two phases. In that case it gives the errors of that push and stops
+where that push stops. Under each profile it prints the errors of that profile's own
+checks and of each deployment that uses it. The errors of a deployment that
+names no profile print under `default`. With `--profile <name>`, the other
+profiles' errors print above the profiles too, since any of them stops the
+push. Push applies only the profiles the deployments use and the one
+`default_profile` names, so it can accept a profile that does not apply. When
+push gives no error and a profile does not apply, the report prints why on a
+`not shown:` line under that profile.
 The report's `target:` line lists the targets of the deployments the profile
 uses, the same ones `--print-store` reads. For an AlloyDB target named by its
 cluster, `--print-store` calls the AlloyDB API to find the cluster's primary
@@ -101,7 +137,7 @@ instance.
 | Flag | Effect |
 |------|--------|
 | `--profile [name]` | Report only this profile. Naming one the model does not declare is an error, not an empty report. Defaults to every profile. |
-| `--print-store` | Print only the store the profile deploys to, on one line and nothing else, for a script to read rather than parse out of the report: `project/instance/database` for a Spanner store, and the backend named ahead of the path for any other (`alloydb:project/region/cluster/instance/database`, `bigquery:project/dataset`). The store is the one the deployments for the profile name: those that name it in `profile`, or that name no profile or `default` for `default`. A legacy profile in `<model>.profiles/` that no deployment names takes the deployments for `default`, unless it sets its own `deployment_target`. Of several, it is the single Spanner or AlloyDB store. For an AlloyDB target named by its cluster, the instance printed is the cluster's primary instance. For a legacy instance-based AlloyDB target, it is the instance the target names. Errors when the scope holds more than one model, since those may name different databases, before any AlloyDB call. Also errors when a deployment names a profile the model does not declare, and when no single store results. Like push, it errors when the model's `extends` do not resolve: one names an entity the model does not declare, they form a cycle, or an entity inherits one field from two unrelated ancestors. A target in no accepted form in any deployment fails it under every profile, and so does a target a `GOOGLE` block lists twice. Like push, it reads every model's profiles first: its profile files, and the profiles a vanilla model carries in its `GOOGLE` block. It errors on a profile file that breaks one of the layout's file rules, such as a `<model>.profile.<name>.yaml` file whose `name:` does not match its file name, on a `GOOGLE` block profile that does not load, and on a profile named `default` in any letter case. Like push, it also errors on a profile file that does not load, such as a file in `<model>.profiles/` whose `name:` does not match its file name. It does not run push's checks that every named profile applies to the model, that each is complete, and that each has valid keys and join columns. So a profile that leaves an entity without a source does not stop it. It does not run push's deployment checks or its dialect check of the model file's fields either. It does not run push's checks on the copies of the model and profile files that push stores in Knowledge Catalog, such as whether each file is valid UTF-8. For an AlloyDB cluster it also errors when the cluster has no primary instance, when the primary is not READY, or when the instance listing fails. |
+| `--print-store` | Print only the store the profile deploys to, on one line and nothing else, for a script to read rather than parse out of the report: `project/instance/database` for a Spanner store, and the backend named ahead of the path for any other (`alloydb:project/region/cluster/instance/database`, `bigquery:project/dataset`). The store is the one the deployments for the profile name: those that name it in `profile`, or that name no profile or `default` for `default`. A legacy profile in `<model>.profiles/` that no deployment names takes the deployments for `default`, unless it sets its own `deployment_target`. Of several, it is the single Spanner or AlloyDB store. For an AlloyDB target named by its cluster, the instance printed is the cluster's primary instance. For a legacy instance-based AlloyDB target, it is the instance the target names. Errors when the scope holds more than one model, since those may name different databases, before any AlloyDB call. Also errors when a deployment names a profile the model does not declare, and when no single store results. Like push, it errors when the model's `extends` do not resolve: one names an entity the model does not declare, they form a cycle, or an entity inherits one field from two unrelated ancestors. A target in no accepted form in any deployment fails it under every profile, and so does a target a `GOOGLE` block lists twice. It reads every model's profiles first: its profile files, and the profiles a vanilla model carries in its `GOOGLE` block. So does `kcmd push --profile <name>`. A plain push that runs in two phases loads the model files before it checks the profile files. It errors on a profile file that breaks one of the layout's file rules, such as a `<model>.profile.<name>.yaml` file whose `name:` does not match its file name, on a `GOOGLE` block profile that does not load, and on a profile named `default` in any letter case. Like push, it also errors on a profile file that does not load, such as a file in `<model>.profiles/` whose `name:` does not match its file name. It does not run push's checks that every named profile applies to the model, that each is complete, and that each has valid keys and join columns. So a profile that leaves an entity without a source does not stop it. It does not run push's deployment checks, its dialect check of the model file's fields, or its check that each concrete entity restates the inherited fields that read a column either. It does not run push's checks on the copies of the model and profile files that push stores in Knowledge Catalog, such as whether each file is valid UTF-8. For an AlloyDB cluster it also errors when the cluster has no primary instance, when the primary is not READY, or when the instance listing fails. |
 
 This is a read of the binding, never a choice of one. Nothing on any `kcmd`
 command line names a store directly; `--profile` selects a binding and the
@@ -130,17 +166,25 @@ action" section. The command fails without writing anything when push rejects
 the deployments. That happens when the target of any deployment is in no
 accepted form, whichever profile the deployment is for. It also happens when
 several targets leave the store ambiguous, or when a deployment names a profile
-the model does not declare. Until push accepts a deployment that names a
-profile, the command accepts one that names `default` or a declared profile,
-which push refuses. It also accepts a profile file that no deployment uses,
-which every graph push refuses, and writes a skill whose store line says there
+the model does not declare. It accepts a deployment that names `default` or a
+declared profile, as push does, but also one that names a legacy
+`semantic_model:` profile, which push refuses. It accepts a Spanner deployment
+that names no profile in a model with metrics, which push refuses. It fails on
+two BigQuery deployments that use one profile, since they leave no single
+store, while push deploys both. It accepts a model that binds a table outside
+the database a deployment deploys to, which push refuses, unless the model has
+actions and that database is the Spanner or AlloyDB store of the selected
+profile. It also accepts a profile file that no deployment uses, as push does,
+and writes a skill whose store line says there
 is none. A vanilla model lists its deployments or targets in a `GOOGLE` block.
 The command fails the same way when a target there is in no accepted form or
-listed twice, or when the block's data is not valid JSON. Like push, it reads
-every model's profiles first: its profile files, and the profiles a vanilla
-model carries in its `GOOGLE` block. It fails on a profile file that breaks one
-of the layout's file rules, such as a `<model>.profile.<name>.yaml` file whose
-`name:` does not match its file name, on a `GOOGLE` block profile that does not
+listed twice, or when the block's data is not valid JSON. It reads every
+model's profiles first: its profile files, and the profiles a vanilla model
+carries in its `GOOGLE` block. So does `kcmd push --profile <name>`. A plain
+push that runs in two phases loads the model files before it checks the
+profile files. It fails on a profile file that breaks one of the layout's file
+rules, such as a `<model>.profile.<name>.yaml` file whose `name:` does not
+match its file name, on a `GOOGLE` block profile that does not
 load, and on a profile named `default` in any letter case. Like push, it also
 fails on a profile file that does not load, such as a file in
 `<model>.profiles/` whose `name:` does not match its file name. It does not run
@@ -252,7 +296,7 @@ entities:
   - name: Customer
     extends: [Party]           # the one keyword you add
     primary_key: [id]          # each subclass keeps its OWN key; keys do not inherit
-    source: proj.ds.customer
+    source: bigquery.googleapis.com/projects/proj/datasets/ds/tables/customer
     fields:
       - { name: id,   expression: c_custkey }
       - { name: name, expression: c_name }                      # the inherited field, bound to this table's column
@@ -260,7 +304,7 @@ entities:
   - name: Supplier
     extends: [Party]
     primary_key: [id]
-    source: proj.ds.supplier
+    source: bigquery.googleapis.com/projects/proj/datasets/ds/tables/supplier
     fields:
       - { name: id,     expression: s_suppkey }
       - { name: name,   expression: s_name }
@@ -271,8 +315,11 @@ entities:
 contributes its field names to every subclass, ordered own fields first then
 inherited. An abstract supertype binds no columns of its own, so each subtype
 supplies the column for every inherited name on its own table — `id` and `name`
-above are bound on both the customer and the supplier. A concrete supertype's
-bound fields flatten straight down, and a subtype need not repeat them.
+above are bound on both the customer and the supplier. Under a concrete
+supertype, a subtype restates each inherited field whose supertype expression
+reads a column. This holds in each named profile, and in the model file when it
+gives the subtype a source. A field whose supertype expression reads only other
+fields flattens straight down.
 
 A subtype redeclares an inherited field only to bind it. The redeclaration
 names the field and gives it a column of the subtype's table. The datatype,
@@ -344,10 +391,10 @@ the shared label's signature is present on every subtype table. An abstract
 entity that no concrete entity extends has nothing to attach to and is dropped
 with a warning. `abstract` is an explicit marker: a non-abstract entity with no
 `source` is treated as a binding error and fails the push, never
-silently dropped as if it were table-less. The Knowledge Catalog leg does not
-model inheritance today, so an abstract entity has no physical resource to
-catalog and is skipped there (with a warning); its concrete subtypes are
-published normally.
+silently dropped as if it were table-less. With the first-generation types, the
+Knowledge Catalog leg skips an abstract entity with a warning and publishes its
+concrete subtypes. With `KC_V2_ASPECTS=1`, every entity gets an entry, and a
+`reference` link runs from each entity to each parent it extends.
 
 A supertype **may** instead be concrete — carry its own `source` and key. It then
 becomes both its own node table and a label on its subtypes. Every subtype table
@@ -376,14 +423,14 @@ concrete leaves).
 
 ## What gets created in Spanner
 
-When the deployment target is a Spanner Graph URI, `push` executes the same
+When the deployment target is a Spanner graph, `push` executes the same
 `CREATE OR REPLACE PROPERTY GRAPH` — but generated for Spanner Graph, which
 differs from BigQuery Graph in five ways:
 
 | Model element | Spanner construct | Notes |
 |---|---|---|
-| Model | `PROPERTY GRAPH` | named by the URI's `propertyGraphs/<g>` segment, **bare** (no backticked `project.dataset.` prefix) |
-| Entity | `NODE TABLE` | backed by the entity's `source` reduced to its final segment (`proj.ds.Orders` → `Orders`), a table in the target database |
+| Model | `PROPERTY GRAPH` | named by the target's `graphs/<g>` segment, **bare** (no backticked `project.dataset.` prefix) |
+| Entity | `NODE TABLE` | backed by the entity's `source` reduced to its final segment (`spanner.googleapis.com/…/tables/Orders` → `Orders`), a table in the target database |
 | Relationship | `EDGE TABLE` | connects the two entities' node tables |
 | Metric | — dropped | Spanner Graph has no `MEASURE`, so every model-level metric is skipped with a warning; the graph structure still deploys |
 | Entity `extends` | extra `LABEL` clauses on the subclass node table | same label-and-flatten handling as BigQuery (see [Class hierarchies](#class-hierarchies-extends--labels)) |
@@ -391,9 +438,11 @@ differs from BigQuery Graph in five ways:
 - **Bare table and graph names.** A Spanner property graph lives inside one
   database and names tables in that same database, so the generator emits bare
   names — no `project.dataset.` qualifier on either the tables or the graph.
-- **No `MEASURE`.** Metrics are dropped (warned per metric), never errored. The
+- **No `MEASURE`.** Metrics are dropped (warned per metric). The
   BigQuery-only rule that a metric must resolve to a single entity therefore does
   not apply to a Spanner target (see [Validation](#validation)).
+  Push refuses a Spanner deployment that names no profile in a model with
+  metrics; name a profile with `metrics_exclude: "*"`.
 - **No per-element `OPTIONS`.** `description` / `synonyms` are not emitted into
   the Spanner DDL; they ride into Knowledge Catalog instead — mirroring how
   BigQuery's graph-level `OPTIONS` is dropped. See
@@ -496,10 +545,59 @@ the metadata stores, what is gated behind `--emit-expressions`, and what is
 never stored, see
 [What push and pull preserve](fidelity.md#to-knowledge-catalog).
 
+### With `KC_V2_ASPECTS=1`
+
+With `KC_V2_ASPECTS=1`, push and pull use a newer set of Knowledge Catalog
+types. Each relationship other than a many-to-many association has an entry of
+its own. Entry ids are `<model>`, `<model>/entities/<entity>`,
+`<model>/metrics/<metric>` and `<model>/relationships/<relationship>`.
+
+A `semantic-link` joins each ordered pair of related entities. Built-in
+`reference` links run from each relationship's entry to the entries of its
+source and target entities, and from each entity's entry to the entry of each
+parent in its `extends`. An unbound relationship gets its `reference` links
+too. Their ids start with `semantic-relationship-` or `semantic-extends-`,
+followed by the first 32 hex characters of a SHA-256 hash. The hash covers
+`<model>/<relationship>/source` or `<model>/<relationship>/target` for a
+relationship, and `<model>/<child>/<parent>` for a parent. Push owns only the
+`reference` links with those prefixes. It deletes the ones the model no longer
+has and leaves every other `reference` link alone. Pull reads no entry link.
+
+An entity's `schema` aspect lists only the fields it declares. A field it
+inherits and only rebinds is a `fieldExpressions[]` record in its
+`sql-expressions` aspect, with nothing in `schema`. A field's `guidelines`,
+`overview` and `semantic-extensions` aspects sit at `Schema.<field>` on the
+entity that declares the field.
+
+`semantic-metric.entity` holds the metric's entity, declared or derived. Pull
+writes it back as `entity:`. `excludedInProfiles` follows the order of the
+model entry's `profiles` list.
+
+Push writes each entry's whole `overview` aspect from the workspace and never
+reads it back. `examples` come from the model file's `ai_context.examples`.
+`content`, `contentType` and `links` come from the entry's sidecar. The
+sidecar is the file `<entry-id>.overview.md` in the directory that holds
+`<model>.yaml`, so the model's sidecar is `<model>.overview.md` and an
+entity's is `<model>/entities/<entity>.overview.md`. The sidecar's frontmatter holds
+`contentType` and `links`, and its body is `content`. `contentType` is
+`MARKDOWN` or `HTML`. Each link has a `url` and an optional `title`. A
+malformed sidecar fails the push before anything is written. Push warns about
+a sidecar that names no entry of the model. A field's overview holds its
+examples alone. An overview edited in the console survives a push only once
+`kcmd pull` writes the edit into the sidecar. Pull writes a sidecar for each
+entry whose overview has content, a content type or links. It warns about a
+local sidecar the catalog did not return, and `--force-remove` deletes it.
+
+Pull writes the model file, and one file per named profile of a Google-flavor
+model. A profile file keeps the actions it binds locally, since the catalog
+stores no profile's actions. A local profile file the pull did not write draws a
+warning, and `--force-remove` deletes it.
+
 ## Validation
 
-`push` and `--validate-only` run the same checks, **before either destination is
-touched**, so a model that cannot deploy fails fast instead of half-deploying.
+`push` and `--validate-only` run the same checks, apart from the Knowledge
+Catalog checks on the entry group, which only a push without `--validate-only`
+runs. [push](#push) says when each check runs.
 Each check enforces a rule the [model specification](model_spec.md) *defines*;
 this section is the operational side of it — what the tool does when the rule is
 broken — and links to the definition it enforces:
@@ -519,20 +617,22 @@ defined in [model spec §1](model_spec.md#1-status-and-baseline),
 and [§4.1](model_spec.md#41-narrowings-stricter-than-ossie).
 
 * **A graph push declares exactly one deployment target per model, and it must
-  be a valid BigQuery Graph or Spanner Graph URI.** A model with more than one is
-  rejected, and so is a single target whose URI matches neither
-  `//bigquery.googleapis.com/projects/<p>/datasets/<d>/propertyGraphs/<g>` nor
-  `//spanner.googleapis.com/projects/<p>/instances/<i>/databases/<db>/propertyGraphs/<g>`,
-  each with or without the leading `//`
-  (for example a `propertyGraph`/`propertyGraphs` typo, or a
-  `…/entryGroups/@bigquery/entries/…` entry form). The error names the offending
-  URI and the expected forms. A **logical model that declares no target** is
-  allowed: it deploys no graph and records to Knowledge Catalog only (so `--no-kc`
-  on it is an error — it would have nowhere to go). This gate runs before any
-  destination leg, so a malformed target writes **nothing** — not to the graph
-  and **not to Knowledge Catalog**; the push aborts with a non-zero exit and no
-  entries are created. Defined in [model spec §4.1](model_spec.md#41-narrowings-stricter-than-ossie)
-  (one target) and [§7.2](model_spec.md#72-deployment-target) (the URI grammar).
+  be a valid BigQuery Graph or Spanner Graph resource name.** A model that lists
+  `deployments:` pushes in two phases and holds each BigQuery and Spanner
+  deployment to this rule on its own. Otherwise a model with more than one is
+  rejected, and so is a single target that matches neither
+  `bigquery.googleapis.com/projects/<p>/datasets/<d>/propertyGraphs/<g>` nor
+  `spanner.googleapis.com/projects/<p>/instances/<i>/databases/<db>/graphs/<g>`
+  (for example a `propertyGraph` typo, a Spanner graph under `propertyGraphs/`,
+  a leading `//`, or a `…/entryGroups/@bigquery/entries/…` entry form). The
+  error names the offending target and what to write instead. A **logical model
+  that declares no target** is allowed: it deploys no graph and records to
+  Knowledge Catalog only (so `--no-kc` on it is an error — it would have
+  nowhere to go). This gate runs before any destination leg, so a malformed
+  target writes **nothing** — not to the graph and **not to Knowledge
+  Catalog**; the push aborts with a non-zero exit and no entries are created.
+  Defined in [model spec §4.1](model_spec.md#41-narrowings-stricter-than-ossie)
+  (one target) and [§7.2](model_spec.md#72-deployment-target) (the grammar).
   *(static)*
 * **Every metric on a BigQuery Graph model resolves to exactly one entity** —
   otherwise it would be dropped from the BigQuery Graph. Set the metric's attach
@@ -541,18 +641,20 @@ and [§4.1](model_spec.md#41-narrowings-stricter-than-ossie).
   metrics by design and imposes no such requirement. Defined in
   [model spec §4.1](model_spec.md#41-narrowings-stricter-than-ossie). *(static)*
 * **Each deployment meets the rules of its engine.** Every push checks each
-  deployment the model declares, whichever binding the push deploys. Each
-  deployment uses the model file's own bindings. They must give every concrete
-  entity a source and every relationship both join column lists. They must
-  also bind every field that each deployed metric reads, directly or through
-  another field. An AlloyDB deployment reads only the `ALLOYDB` or `ANSI_SQL`
-  text of each metric and field. A Spanner deployment deploys no metric. A
-  BigQuery deployment turns each metric into a measure, so each metric must be
-  `SUM`, `AVG`, `COUNT`, `MIN` or `MAX` over one operand, and the entity it
-  belongs to needs a primary key or a unique key. The measure rule skips a
-  metric that has only a vendor text. A push of a profile in the older
-  `<model>.profiles/` layout deploys that profile's bindings instead, so it
-  skips this check. *(static)*
+  deployment the model declares, whether or not the push deploys it. A
+  deployment that names no profile uses the model file's own bindings. They
+  must give every concrete entity a source and every relationship both join
+  column lists. They must also bind every field that each deployed metric
+  reads, directly or through another field. An AlloyDB deployment reads only
+  the `ALLOYDB` or `ANSI_SQL` text of each metric and field. A Spanner
+  deployment deploys no metric. A BigQuery deployment turns each metric into a
+  measure, so each metric must be `SUM`, `AVG`, `COUNT`, `MIN` or `MAX` over
+  one operand, and the entity it belongs to needs a primary key or a unique
+  key. The measure rule skips a metric that has only a vendor text.
+  A deployment that names a profile is held to the measure rule under that
+  profile, with the keys it states, except for the metrics it leaves
+  unavailable. On Spanner, that profile must leave every metric unavailable.
+  *(static)*
 * **Each field the model file binds has a text its entity's database runs.**
   The field needs an entry in the dialect of its entity's source, an
   `ANSI_SQL` entry, or the string form. The model file's own bindings may span
@@ -561,12 +663,17 @@ and [§4.1](model_spec.md#41-narrowings-stricter-than-ossie).
   check, whether or not a deployment uses those bindings. *(static)*
 * Every class hierarchy follows the inheritance rules. `extends` forms no cycle,
   and no field is declared by two supertypes that do not extend each other. A
-  subtype redeclares an inherited field only to bind it. An
+  subtype redeclares an inherited field only to bind it. A concrete entity
+  with a source restates each inherited field whose ancestor's expression reads
+  a column. An
   abstract entity declares no source, key or field expression. Relationships
   and metrics attach only to concrete leaf entities. The rules and their
   reasons are in [Class hierarchies](#class-hierarchies-extends--labels).
   These checks run on every push, including a `--no-profile` push to
   Knowledge Catalog alone. *(static)*
+* **Relationships join two different entities in one direction.** Push rejects
+  a relationship from an entity to itself, and relationships in both directions
+  between two entities. *(static)*
 * **Every action is well-formed.** Each action parameter must settle on one
   scalar datatype: projected from a field it names with `concept` and `field`,
   or stated as its own `type`. Naming an entity as a `type`, or restating a
@@ -652,15 +759,25 @@ and [§4.1](model_spec.md#41-narrowings-stricter-than-ossie).
   `escalate` / `warn` and `critical` / `high` / `medium` / `low` — so an
   unrecognized word is a hard load error rather than a value that publishes and
   means nothing. *(static)*
+* **Each deployment's tables are in the database it deploys to.** A Spanner or
+  AlloyDB deployment reads only tables in its target database. A BigQuery
+  deployment reads only BigQuery or BigLake tables, in any dataset of any
+  project. A Cloud SQL table fails every deployment. A push in two phases checks
+  every deployment this way, whether or not `--deployment` names it, and under
+  `--no-deployment` too. It reads each entity's `source` from the profile the
+  deployment names, or from the model file when it names none. *(static)*
 * **Every entity's source table is reachable.** For a **BigQuery-targeting**
   model, each `source` is probed with a dry-run query, so BigQuery resolves it
-  exactly as the deploy will — a three-part `project.dataset.table`, a four-part
-  federated REST-catalog name (e.g. an Iceberg table via BigLake), or a quoted
-  identifier all work. A table that does not exist or that you cannot access fails
-  the push, naming the table and the entity; a `source` that is a query (not a
-  table) is skipped. A **Spanner-targeting** model's sources live in Spanner
-  (a different system) and are **not** probed here. The `source` construct and its
-  URI/dotted forms are defined in [model spec §7.1](model_spec.md#71-table-sources).
+  exactly as the deploy will — a BigQuery table or a BigLake table (e.g. an
+  Iceberg table in a federated REST catalog). A table that does not exist or that
+  you cannot access fails the push, naming the table and the entity. On a push
+  that uses deployments, push probes the tables of the deployments it would
+  deploy, each in the location of the graph's dataset when push can read it. A
+  table in another location fails the push, and the error names the table's
+  location when BigQuery reports it. A
+  **Spanner-targeting** model's sources live in Spanner (a different system) and
+  are **not** probed here. The `source` construct and the resource names it takes
+  are defined in [model spec §7.1](model_spec.md#71-table-sources).
   *(live — needs BigQuery access)*
 * **Every `sql` executor statement is accepted by the store it will run
   against.** Each statement is sent to the bound store with the request that
@@ -732,11 +849,14 @@ and each aspect type attached, so a push needs, on the destination entry group:
 * `dataplex.entryLinks.create` and `dataplex.entryLinks.delete` — the
   `schema-join` links, when the model has relationships
 * `dataplex.entryGroups.useSchemaAspect` — every entity carries the built-in
-  `schema` aspect (its fields, keys, unique keys, and labels)
+  `schema` aspect (its fields, keys, unique keys, and labels; with
+  `KC_V2_ASPECTS=1`, the fields it declares and no keys)
 * `dataplex.entryGroups.useGuidelinesAspect` — when the model, an entity, or a
   metric carries `ai_context.instructions`
 * `dataplex.entryGroups.useSchemaJoinAspect` and
   `dataplex.entryGroups.useSchemaJoinEntryLink` — when the model has relationships
+* `dataplex.entryGroups.useReferenceEntryLink` — with `KC_V2_ASPECTS=1`, when
+  the model has relationships or an entity extends another
 * the `use<AspectType>Aspect` permission for the `semantic-model`,
   `semantic-entity`, and `semantic-metric` aspect types the push attaches — i.e.
   `dataplex.entryGroups.useSemanticModelAspect`, `useSemanticEntityAspect`, and

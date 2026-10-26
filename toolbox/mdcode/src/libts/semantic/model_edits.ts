@@ -12,7 +12,7 @@ import * as md from '../metadata';
 import {Entity, SemanticModel} from './ir';
 import {aspectDataOf, readAiContext, readDeploymentTargets, readEntity, readMetric} from './kc_converter';
 import {readRelationshipEntry, RELATIONSHIP_TYPE} from './kc_relationships';
-import {deploymentProfileError, LoadedModel} from './loader';
+import {LoadedModel} from './loader';
 import {ElementList, ModelDocument} from './model_document';
 import {ElementKind, loadModelFile, ModelFile, modelEntries, ModelScope, ViewEntry} from './model_entries';
 import {NameKind, nameProblem} from './names';
@@ -473,13 +473,11 @@ function savedOutcome(
 
 
 // The errors `kcmd push --no-profile` gives for the model from its local
-// checks: a deployment that names a profile, then validatePushRequirements as
-// a catalog-only push runs it. The checks of named profiles are left to push.
+// checks: validatePushRequirements as a catalog-only push runs it. The checks
+// of named profiles are left to push.
 function checkErrors(model: SemanticModel, document: string): string[] {
   const models: LoadedModel[] = [{document, model}];
   const errors: string[] = [];
-  const profileError = deploymentProfileError(models);
-  if (profileError) errors.push(profileError);
   errors.push(...validatePushRequirements(models, {
     targetOptional: true,
     fieldsPruned: false,

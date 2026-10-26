@@ -21,6 +21,8 @@ export class SplitSource implements CatalogSource {
   readonly name: string;
   readonly ingestedEntries = false;
   readonly layout = Layouts.SPLIT;
+  readonly defaultAspects = [];
+  readonly systemAspects = [];
 
   readonly project: string;
   readonly location: string;

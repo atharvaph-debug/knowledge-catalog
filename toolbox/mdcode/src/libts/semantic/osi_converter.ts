@@ -47,7 +47,7 @@ import * as yaml from 'yaml';
 
 import {googleBlockTargets, unnamedDeployments} from './deployment_target';
 import {Action, ActionParameter, AffectedConcept, AiContext, ALLOWED_DIALECTS, Constraint, CustomExtension, Entity, Executor, Field, Metric, ProfileSpec, Relationship, SemanticModel, SqlDialect} from './ir';
-import {FORMAT_VERSION_PLACEMENT, FormatVersion, GOOGLE_VERSION, isAcceptedSource, OSSIE_VERSION} from './loader';
+import {FORMAT_VERSION_PLACEMENT, FormatVersion, GOOGLE_VERSION, OSSIE_VERSION, writtenSource} from './loader';
 import {nameProblem} from './names';
 import {declaredConceptFields} from './resolve_inheritance';
 import {DEFAULT_PROFILE} from './resolve_profiles';
@@ -191,7 +191,8 @@ function profileDocuments(model: SemanticModel, warnings: string[]):
  * `logical` marks the model as a purely logical one (no physical binding).
  * Under GOOGLE_VERSION it suppresses the missing-source and missing-expression
  * warnings, which flag a lossy pull of a bound model. OSSIE_VERSION requires
- * both, so they are still given. An OWL import sets it; `pull` does not.
+ * both, so they are still given. An OWL import sets it, and so does a
+ * second-generation pull, which loses no binding.
  *
  * `compactFlow` renders leaf collections (scalar sequences, all-scalar maps) in
  * flow style so the output matches the compact convention the semantic-model
@@ -464,13 +465,10 @@ export function datasetDoc(
   return compact({
     name: entity.name,
     // An abstract entity has no physical table, so its source is empty; omit
-    // the key rather than emit `source: ""` (which the loader rejects). Prefer
-    // `authoredSource` when `isAcceptedSource` accepts it so resource URIs and
-    // catalog names survive serialization, and fall back to `dataSource` when
-    // `authoredSource` was a legacy bare name that the load qualified.
-    source: (isAcceptedSource(entity.authoredSource) ? entity.authoredSource :
-                                                       entity.dataSource) ||
-        undefined,
+    // the key rather than emit `source: ""` (which the loader rejects). The
+    // source as written survives serialization; a legacy bare name is written
+    // as the name the load qualified it to.
+    source: writtenSource(entity) || undefined,
     // Supertype entities (entity-level inheritance); native under
     // GOOGLE_VERSION, or in the dataset's GOOGLE block under OSSIE_VERSION.
     extends: nativeExtends,
@@ -1009,7 +1007,7 @@ function blockTargets(ext: CustomExtension, modelName: string): string[] {
 
 // Drops undefined-valued keys so the emitted YAML only shows fields the model
 // actually set (matching the emitters' `compact` convention).
-function compact<T extends Record<string, any>>(obj: T): T {
+export function compact<T extends Record<string, any>>(obj: T): T {
   const out: Record<string, any> = {};
   for (const [k, v] of Object.entries(obj)) {
     if (v !== undefined) out[k] = v;
@@ -1019,6 +1017,6 @@ function compact<T extends Record<string, any>>(obj: T): T {
 
 // Returns the array, or undefined when empty/absent, so an empty list is
 // omitted rather than rendered as `[]`.
-function nonEmpty<T>(items: T[]|undefined): T[]|undefined {
+export function nonEmpty<T>(items: T[]|undefined): T[]|undefined {
   return items && items.length ? items : undefined;
 }

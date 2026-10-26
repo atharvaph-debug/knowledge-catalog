@@ -84,17 +84,26 @@ export function modelEntries(
     location: scope.location,
     entryGroup: scope.entryGroup,
     emitExpressions: true,
-    v2Aspects: scope.v2Aspects,
+    v2Aspects: false,
   });
   const relationships = (model.relationships ?? [])
                             .map(rel => relationshipEntry(model, rel, names));
-  return [...entries, ...relationships].map(e => ({
-                                              entry: toViewEntry(e),
-                                              kind: kindOf(e),
-                                              element:
-                                                  e.entrySource?.displayName ??
-                                                  '',
-                                            }));
+  return [...entries, ...relationships].map(e => {
+    const kind = kindOf(e);
+    const element = e.entrySource?.displayName ?? '';
+    const entry = toViewEntry(e);
+    if (scope.v2Aspects) {
+      if (kind === 'model') {
+        entry.name = names.modelId(model);
+      } else if (kind === 'entity') {
+        entry.name = names.entityId(model, {name: element} as any);
+      } else if (kind === 'metric') {
+        entry.name = names.metricId(model, {name: element} as any);
+      }
+      if (entry.resource.parent) entry.resource.parent = names.modelId(model);
+    }
+    return {entry, kind, element};
+  });
 }
 
 

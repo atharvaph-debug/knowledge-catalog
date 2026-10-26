@@ -191,7 +191,11 @@ an error. A diamond flattens, with each ancestor contributing once. A field
 declared or rebound by two supertypes that do not extend each other is an error,
 because nothing says which one wins. A subtype MAY redeclare an inherited field
 only to bind it, with an `expression` and nothing else; the definition comes
-from the ancestor that declares it. A relationship endpoint and a metric's entity MUST be a concrete
+from the ancestor that declares it. A concrete subtype MUST rebind each
+inherited field whose ancestor's expression reads a column, because that column
+belongs to the ancestor's table. This holds in each named profile, and in the
+model file when it gives the subtype a source.
+A relationship endpoint and a metric's entity MUST be a concrete
 leaf: not abstract, and not extended by another dataset.
 How the hierarchy is *lowered* into each store (labels, field flattening) and the
 downstream limits (e.g. a supertype whose label is shared across subtype tables
@@ -221,7 +225,9 @@ name datasets declared in the same model. `to_columns` MUST contain every column
 of a primary or unique key of the `to` dataset; a superset of a key counts.
 An edge is N:1 or 1:1 only when its join columns cover a key, so join columns
 that cover no key are rejected on every push, a catalog-only push included.
-Each binding of the relationship may cover a different key.
+Each binding of the relationship may cover a different key. A relationship MUST
+join two different datasets, and two datasets MUST NOT have relationships in
+both directions.
 
 Ossie **requires** both join-column lists; allowing both to be omitted — a
 logical edge with no join keys — is a `kcmd` **relaxation** ([§4](#4-narrowings-and-relaxations))
@@ -385,6 +391,10 @@ Each rule and its reason:
 
 - **A metric belongs to a concrete leaf.** A metric whose entity is abstract, or
   extended by another entity, is rejected on every push.
+
+- **A relationship joins two different datasets in one direction.** A
+  relationship from a dataset to itself is rejected, and so are relationships
+  in both directions between two datasets ([§2.2](#22-relationship)).
 
 - **Only SQL dialects are accepted.** An expression entry whose `dialect` is
   `MDX`, `TABLEAU`, `MAQL` or `THOUGHTSPOT` is a hard load error
@@ -606,14 +616,19 @@ custom_extensions:
 `custom_extensions` MAY appear on the model, a dataset, a field, a relationship,
 and a metric. `data` is opaque to Ossie. `kcmd` reads a `GOOGLE` block's payload
 into the model when it parses the document, and carries any other vendor's block
-verbatim. An Ossie-only tool treats a `GOOGLE` block as a vendor extension it does
+verbatim. `vendor_name` matches `GOOGLE` in any letter case, so `Google` and
+`google` name the same vendor. A model file that pull rebuilds from the catalog
+metadata writes the vendor name as `GOOGLE`.
+An Ossie-only tool treats a `GOOGLE` block as a vendor extension it does
 not recognize and passes it through unchanged — so a vanilla `kcmd` model is still
 a valid Ossie document, and stripping the `GOOGLE` blocks yields plain Ossie. A
 model's deployments ride here as a `GOOGLE` block carrying
 `{"deployments": [{"name": "…", "target": "…"}]}`. The older form,
 `{"deploymentTargets": ["…"]}`, is still read. The native keys (`entities`,
-`deployment_target`, `extends`, `abstract`) are **not accepted** under vanilla —
-each is an unknown key and rejected ([§4.1](#41-narrowings-stricter-than-ossie)).
+`deployments`, `deployment_target`, `profiles`, `extends`, `abstract`, metric
+`entity`, relationship `description`) are **not accepted** under vanilla — each
+is rejected with a message naming the `GOOGLE` `custom_extensions` block or
+`0.2.0.dev0/google` ([§4.1](#41-narrowings-stricter-than-ossie)).
 
 **Extended `0.2.0.dev0/google` — native keys.** Under the extended profile the same
 information is written as first-class keys — `entities`, `deployment_target`,
@@ -664,39 +679,45 @@ columns, a field's `expression`, a relationship's join columns, and an action's
 profile](#73-binding-profiles), so one logical model deploys to several stores,
 in each store's own table and column names, and performs its writes by whatever
 mechanism each store has. A named profile states every relationship's join
-columns itself ([§7.3](#73-binding-profiles)). What a profile cannot change is
-an entity's key shape, which is the same under every binding. In every binding,
-a relationship's join columns cover a key of its target.
+columns itself, and its own keys for each entity whose keys the model file
+states ([§7.3](#73-binding-profiles)). Key shapes may differ between profiles.
+In every binding, a relationship's join columns cover a key of its target.
 
 ### 7.1. Table sources
 
-`source` is a resource URI naming the backing table:
+`source` is the GCP resource name of the backing table, with no leading `//`:
 
 ```
-//bigquery.googleapis.com/projects/<p>/datasets/<d>/tables/<table>
-//spanner.googleapis.com/projects/<p>/instances/<i>/databases/<db>/tables/<table>
+bigquery.googleapis.com/projects/<p>/datasets/<d>/tables/<table>
+spanner.googleapis.com/projects/<p>/instances/<i>/databases/<db>/tables/<table>
 ```
 
-For BigQuery a dotted shorthand is also accepted: `dataset.table` (qualified with
-the scope's project) or `project.dataset.table`; a name with more than three parts
-points at a table in a federated REST catalog. Ossie requires `source` on every
-dataset; `kcmd` relaxes it to optional ([§4.2](#42-relaxations-looser-than-ossie))
-so a purely logical model loads, but a non-abstract dataset in a model bound for a
-graph MUST have one.
+A resource URI, the same name with a leading `//`, and a Knowledge Catalog name
+such as `bigquery:<p>.<d>.<t>` are rejected, and the error names the resource
+name to write. [profiles.md](profiles.md#sources) lists every accepted store.
+Ossie requires `source` on every dataset; `kcmd` relaxes it to optional
+([§4.2](#42-relaxations-looser-than-ossie)) so a purely logical model loads, but
+a non-abstract dataset in a model bound for a graph MUST have one.
 
 ### 7.2. Deployment target
 
-`deployment_target` is a single resource URI whose host selects the store:
+`deployment_target` is a single GCP resource name, with no leading `//`, whose
+host selects the store. A resource URI or a Knowledge Catalog name is rejected,
+and the error names the form to write:
 
 ```
 # BigQuery Graph — analytical
-//bigquery.googleapis.com/projects/<p>/datasets/<d>/propertyGraphs/<g>
+bigquery.googleapis.com/projects/<p>/datasets/<d>/propertyGraphs/<g>
 
 # Spanner Graph — operational
-//spanner.googleapis.com/projects/<p>/instances/<i>/databases/<db>/propertyGraphs/<g>
+spanner.googleapis.com/projects/<p>/instances/<i>/databases/<db>/graphs/<g>
 ```
 
-The URI MUST match one of these two shapes. A model bound for a graph MUST declare
+Each is the name Dataplex gives the graph's entry: a BigQuery graph is under
+`propertyGraphs/`, a Spanner graph under `graphs/`. A Spanner graph written with
+`propertyGraphs/` is rejected, and the error names its `graphs/` name.
+
+The name MUST match one of these two shapes. A model bound for a graph MUST declare
 exactly one ([§4](#4-narrowings-and-relaxations)). The identifier segments are
 restricted to `[A-Za-z0-9_-]`. The native `deployment_target:` key shown here is the
 extended-profile form; under vanilla Ossie the same target rides in a `GOOGLE`
@@ -717,8 +738,12 @@ definition. A profile:
 - binds by `name` at each level, including a field the entity inherits. It is an
   overlay: a field the profile does not name keeps the model file's binding, and a
   field in `fields_exclude` is left **unbound** for that profile; there is no
-  `unbound` flag. An action the profile does not mention keeps the model's
-  executor, and `executor: null` withdraws it.
+  `unbound` flag. A field whose expression reads a column MUST be restated or
+  excluded, because that column belongs to the model file's table. A column is
+  a reference that no entity name qualifies. An action the profile does not
+  mention keeps the model's executor, and `executor: null` withdraws it.
+- MUST state `primary_key` for an entity whose primary key the model file
+  states, and `unique_keys` for one whose unique keys it states.
 - MAY give a field any expression the logical model could: a column, a
   computation, or the `dialects` form.
 
@@ -799,15 +824,15 @@ semantic_model:
 version: "0.2.0.dev0/google"   # native deployment_target key -> extended profile
 semantic_model:
   - name: sales
-    deployment_target: "//bigquery.googleapis.com/projects/acme/datasets/sales/propertyGraphs/sales"
+    deployment_target: "bigquery.googleapis.com/projects/acme/datasets/sales/propertyGraphs/sales"
     datasets:
       - name: orders
-        source: acme.raw.orders
+        source: bigquery.googleapis.com/projects/acme/datasets/raw/tables/orders
         fields:
           - { name: order_id,   expression: o_id }
           - { name: net_amount, expression: o_net }
       - name: customer
-        source: acme.raw.customer
+        source: bigquery.googleapis.com/projects/acme/datasets/raw/tables/customer
         fields:
           - { name: customer_id, expression: c_id }
           - { name: name,        expression: c_name }

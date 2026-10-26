@@ -11,13 +11,14 @@ import {AlloyDbClient} from '../../src/libts/gcp/alloydb';
 import {ApiContext} from '../../src/libts/gcp/context';
 import {createSemanticRuntimes} from '../../src/libts/semantic/runtime/runtime';
 import {profiles, skillsGenerate} from '../../src/tool/commands';
+import {stubCloudSqlEntry} from '../libts/mocks';
 
 const CTX = new ApiContext('test-project', 'us', 'test-token');
 const SPANNER_DB =
-    '//spanner.googleapis.com/projects/acme-ops/instances/prod/databases/commerce';
-const BQ = '//bigquery.googleapis.com/projects/acme';
+    'spanner.googleapis.com/projects/acme-ops/instances/prod/databases/commerce';
+const BQ = 'bigquery.googleapis.com/projects/acme';
 const CLUSTER =
-    '//alloydb.googleapis.com/projects/acme-ops/locations/us-central1/clusters/main';
+    'alloydb.googleapis.com/projects/acme-ops/locations/us-central1/clusters/main';
 
 let dir = '';
 let cwd = '';
@@ -125,7 +126,7 @@ describe('the profiles report and --print-store', () => {
         'commerce.yaml',
         model(
             `      - name: prod\n` +
-                `        target: ${SPANNER_DB}/propertyGraphs/commerce\n` +
+                `        target: ${SPANNER_DB}/graphs/commerce\n` +
                 `        profile: prod\n`,
             `${SPANNER_DB}/tables/Orders`, false));
     writeModel(
@@ -137,7 +138,7 @@ describe('the profiles report and --print-store', () => {
     out = [];
     await profiles({profile: 'prod'});
     const target = out.find(l => l.trim().startsWith('target:'));
-    expect(target).toBe(`    target: ${SPANNER_DB}/propertyGraphs/commerce`);
+    expect(target).toBe(`    target: ${SPANNER_DB}/graphs/commerce`);
   });
 
   test('agree on the target of a legacy wrapper', async () => {
@@ -148,7 +149,7 @@ describe('the profiles report and --print-store', () => {
                 `        target: ${BQ}/datasets/sales/propertyGraphs/commerce\n` +
                 `        profile: analytical\n` +
                 `      - name: prod\n` +
-                `        target: ${SPANNER_DB}/propertyGraphs/commerce\n`,
+                `        target: ${SPANNER_DB}/graphs/commerce\n`,
             `${SPANNER_DB}/tables/Orders`, false));
     const eg = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
     fs.mkdirSync(path.join(eg, 'commerce.profiles'), {recursive: true});
@@ -165,7 +166,7 @@ describe('the profiles report and --print-store', () => {
     await profiles({profile: 'staging'});
     const target = out.find(l => l.trim().startsWith('target:'));
     expect(target).toBe(
-        `    target: ${SPANNER_DB}/propertyGraphs/commerce`);
+        `    target: ${SPANNER_DB}/graphs/commerce`);
   });
 });
 
@@ -179,7 +180,7 @@ describe('a deployment that names profile default', () => {
              'commerce.yaml',
              model(
                  `      - name: main\n` +
-                     `        target: ${SPANNER_DB}/propertyGraphs/commerce\n` +
+                     `        target: ${SPANNER_DB}/graphs/commerce\n` +
                      `        profile: default\n`,
                  `${SPANNER_DB}/tables/Orders`, false));
          const eg = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
@@ -211,7 +212,7 @@ describe('a legacy wrapper whose deployment_target is in no accepted form', () =
         'commerce.yaml',
         model(
             `      - name: prod\n` +
-                `        target: ${SPANNER_DB}/propertyGraphs/commerce\n`,
+                `        target: ${SPANNER_DB}/graphs/commerce\n`,
             `${SPANNER_DB}/tables/Orders`, false));
     const eg = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
     fs.mkdirSync(path.join(eg, 'commerce.profiles'), {recursive: true});
@@ -235,7 +236,7 @@ describe('a deployment whose profile is a typo', () => {
         'commerce.yaml',
         model(
             `      - name: prod\n` +
-                `        target: ${SPANNER_DB}/propertyGraphs/commerce\n` +
+                `        target: ${SPANNER_DB}/graphs/commerce\n` +
                 `        profile: prdo\n`,
             `${SPANNER_DB}/tables/Orders`).replace(/        executor:\n(.*\n){3}/, ''));
     writeModel(
@@ -259,7 +260,7 @@ semantic_model:
   - name: commerce
     deployments:
       - name: prod
-        target: ${SPANNER_DB}/propertyGraphs/commerce
+        target: ${SPANNER_DB}/graphs/commerce
     entities:
       - name: A
         extends: [B]
@@ -280,4 +281,69 @@ semantic_model:
          expect(rt.error).toStartWith("[commerce] model 'commerce': ");
          expect(rt.error).toContain('cycle');
        });
+});
+
+
+// A Cloud SQL table written as its resource name takes its dialect from its
+// Knowledge Catalog entry, which the runtime looks up before it loads.
+describe('a Cloud SQL source written as a resource name', () => {
+  const TABLE = 'cloudsql.googleapis.com/projects/acme-ops/locations/us-central1/' +
+      'instances/ms/databases/shop/schemas/sales/tables/Orders';
+  const DEPLOY = '      - {name: default, target: ' +
+      'bigquery.googleapis.com/projects/acme/datasets/d/propertyGraphs/g}\n';
+
+  test('takes the dialect its catalog entry gives', async () => {
+    writeModel('commerce.yaml', model(DEPLOY, TABLE, false));
+    const lookup = stubCloudSqlEntry(200, 'cloudsql-sqlserver-table');
+    const rt = await createSemanticRuntimes({ctx: CTX});
+    if ('error' in rt) throw new Error(rt.error);
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(rt[0].model.entities[0].sourceDialect).toBe('SQLSERVER');
+  });
+
+  test('a profile file that binds one takes the dialect its catalog entry gives', async () => {
+    writeModel('commerce.yaml', model(DEPLOY, `${SPANNER_DB}/tables/Orders`, false));
+    writeModel('commerce.profile.prod.yaml',
+               `name: prod\nentities:\n  - name: Order\n    source: ${TABLE}\n`);
+    stubCloudSqlEntry(200, 'cloudsql-sqlserver-table');
+    const rt = await createSemanticRuntimes({ctx: CTX, profile: 'prod'});
+    if ('error' in rt) throw new Error(rt.error);
+    expect(rt[0].model.entities[0].sourceDialect).toBe('SQLSERVER');
+
+    // So does a profile in a vanilla model's GOOGLE block, and one that binds
+    // nothing keeps the model file's Spanner source, which needs no lookup.
+    fs.rmSync(path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg', 'commerce.profile.prod.yaml'));
+    const profiles = [
+      {name: 'prod', entities: [{name: 'Order', source: TABLE}]},
+      {name: 'logical', entities: []},
+    ];
+    writeModel('commerce.yaml', `version: "0.2.0.dev0"
+semantic_model:
+  - name: commerce
+    custom_extensions:
+      - vendor_name: GOOGLE
+        data: '${JSON.stringify({profiles})}'
+    datasets:
+      - name: Order
+        source: ${SPANNER_DB}/tables/Orders
+        primary_key: [key]
+        fields:
+          - name: key
+            expression: {dialects: [{dialect: ANSI_SQL, expression: OrderId}]}
+`);
+    for (const [profile, dialect] of [['prod', 'SQLSERVER'], ['logical', undefined]]) {
+      const block = await createSemanticRuntimes({ctx: CTX, profile});
+      if ('error' in block) throw new Error(block.error);
+      expect(block[0].model.entities[0].sourceDialect).toBe(dialect);
+    }
+  });
+
+  test('stops with the Dataplex message when its entry cannot be read', async () => {
+    writeModel('commerce.yaml', model(DEPLOY, TABLE, false));
+    stubCloudSqlEntry(403);
+    const rt = await createSemanticRuntimes({ctx: CTX});
+    expect('error' in rt && rt.error).toContain(
+        "Turn on Dataplex integration for instance 'ms' (gcloud sql instances " +
+        'patch ms --enable-dataplex-integration --project acme-ops)');
+  });
 });

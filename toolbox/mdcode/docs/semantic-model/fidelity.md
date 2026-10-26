@@ -95,9 +95,10 @@ agree on every structural row and differ only where a Spanner target has no
 11. **Vendor-dialect fallback.** What you author is the `expression.dialects[]`
     list. `importedExpression` / `importedDialect` are not authored keys — the
     loader *derives* them from a non-canonical dialect entry (for example the
-    MAQL or Snowflake form a metric was imported from). A BigQuery graph reads
-    a field's or metric's `BIGQUERY` entry, else its `ANSI_SQL` one, else the
-    SQL `push --transpile` translated from the vendor text. It never emits the
+    MAQL or Snowflake form a metric was imported from). `push --transpile`
+    adds a `BIGQUERY` dialect entry translated from a vendor-only expression
+    or from an `ANSI_SQL` expression that double-quotes column names. A BigQuery
+    graph reads a field's or metric's `BIGQUERY` entry, else its `ANSI_SQL` one. It never emits the
     vendor text. A field with none of these is left out of its node table with
     a warning, though push rejects such a field in the model file first. A
     metric with none, or one that aggregates such a field, is
@@ -129,15 +130,14 @@ agree on every structural row and differ only where a Spanner target has no
     rejected before anything deploys. Knowledge Catalog still records a single
     binding — the one named by `--profile`, else the default binding, which is
     what an `--all-profiles` run always records, the two flags being mutually
-    exclusive. See [Binding profiles](profiles.md).
+    exclusive. A [push in two phases](reference.md#push) records the model file
+    as written instead. See [Binding profiles](profiles.md).
 15. **Relationships with no link.** Knowledge Catalog keeps one `schema-join`
     link between two entries, so when several relationships join the same two
     entities, push links the first one it can publish and skips the rest with
-    a warning. Knowledge Catalog does not support a relationship from an entity
-    to itself, so push skips it with a warning. The catalog metadata holds no
-    link for a skipped relationship. `pull` still returns it from the stored
-    copy of the model file, and leaves it out only when it rebuilds the file
-    from the metadata.
+    a warning. The catalog metadata holds no link for a skipped relationship.
+    `pull` still returns it from the stored copy of the model file, and leaves
+    it out only when it rebuilds the file from the metadata.
 
 ## To Knowledge Catalog
 
@@ -151,7 +151,8 @@ provisions. A push references those types and never creates them (see
 What is recorded depends on the push. A catalog-only push (`--no-profile`), or a
 purely logical model with no bindings, records the whole model: every entity,
 metric, and relationship the document declares, apart from the relationships in
-footnote 15. A push that also deploys a graph
+footnote 15. A [push in two phases](reference.md#push) does too. Any other push
+that also deploys a graph
 first prunes the model to what that graph binds, so an unbound field — and any
 entity, metric, or relationship that depends on it — is left out of the catalog
 entries too. A pull still returns the authored model file from its stored copy.
@@ -168,7 +169,8 @@ Spanner, say — and `kcmd push --all-profiles` deploys a graph for each. The
 catalog leg does not fan out with it: it runs once, against the profile named by
 `--profile`, otherwise the default binding. So a bare `kcmd push` and a
 `kcmd push --all-profiles` write the same entries and differ only in how many
-graphs they deploy.
+graphs they deploy. A [push in two phases](reference.md#push) records the model
+file as written instead.
 
 Nor do successive pushes accumulate. Entry ids are derived from logical names
 alone — model, entity, metric — with no profile component, so pushing a second
@@ -266,9 +268,9 @@ drops graph-statement `OPTIONS`, so the model's `description` / `ai_context` are
 not in the graph — the `description` and `ai_context.instructions` are carried
 into Knowledge Catalog instead. Unique keys beyond the primary key are also
 dropped (only the primary key is emitted). The imported vendor SQL is never
-emitted. The graph builds each field and metric from its `BIGQUERY` entry, else
-its `ANSI_SQL` one, else the SQL `push --transpile` translated from the vendor
-SQL. A field with none of these is left out of its node table with a warning,
+emitted. `push --transpile` adds a `BIGQUERY` entry for a vendor-only
+expression or an `ANSI_SQL` expression that double-quotes column names, and the
+graph builds each field and metric from its `BIGQUERY` entry, else its `ANSI_SQL` one. A field with none of these is left out of its node table with a warning,
 though push rejects such a field in the model file first. A
 metric with none, or one that aggregates such a field, is skipped with a
 warning.
@@ -314,6 +316,10 @@ model has no `kcmd-push-id` label and no stored copy, such as a model an older
 after the model. [Pull](README.md#pull) says when `pull` refuses the catalog
 instead.
 
+With `KC_V2_ASPECTS=1`, pull rebuilds the model file, profile files and overview
+sidecars from the metadata, and writes each metric's entity as `entity:`,
+declared or derived. See [Reference](reference.md#with-kc_v2_aspects1).
+
 `pull` returns what push wrote — the **Recovered by `pull`** column above is the
 summary. When the push deployed a graph, what push wrote was already pruned to
 the bound view (see [To Knowledge Catalog](#to-knowledge-catalog)), so pull
@@ -357,7 +363,6 @@ what pull can recover. It is recorded here as a write-side follow-up; the reader
   it is the same class of gap as the `semantics` field that gates
   `--emit-expressions`.
 
-(A deployment target in no supported form is **not** a pull gap. A graph push
-rejects it at the validation gate before anything is written; see
-[Validation](reference.md#validation). A catalog-only push (`--no-profile`)
-stores it on the model entry, and pull returns it.)
+(A deployment target in no supported form is **not** a pull gap. Every push
+rejects it at the validation gate before anything is written, a catalog-only
+push (`--no-profile`) too; see [Validation](reference.md#validation).)

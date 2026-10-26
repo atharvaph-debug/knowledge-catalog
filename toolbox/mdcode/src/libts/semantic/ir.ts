@@ -108,6 +108,10 @@ export interface Entity {
   // target's addressing scheme.
   dataSource: string;
   authoredSource?: string;  // the source string as typed
+  // The dialect of a Cloud SQL table written as its resource name, as its
+  // Knowledge Catalog entry's type names it. Set only when the load was given
+  // the dialects a lookup read (LoadOptions.cloudSqlDialects).
+  sourceDialect?: string;
   keys: string[];  // grain / primary key
   // Additional uniqueness constraints beyond the primary key; each inner array
   // is one unique column set (maps to the Schema aspect's uniqueConstraints).
@@ -846,7 +850,7 @@ export interface Constraint {
 
 export interface DeploymentSpec {
   name: string;      // unique among the model's deployments
-  // A resource URI or a Knowledge Catalog FQN, verbatim. Three kinds are
+  // A GCP resource name, as written. Three kinds are
   // valid: a BigQuery graph, a Spanner graph, an AlloyDB database.
   // `deployment_target.ts` already parses all three. Keep this opaque.
   target: string;

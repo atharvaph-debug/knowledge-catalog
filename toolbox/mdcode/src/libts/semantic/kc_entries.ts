@@ -121,6 +121,15 @@ export function isMetricEntry(entry: Entry): boolean {
 }
 
 /**
+ * Returns true when `entry` is the entry of a model, entity, metric or
+ * relationship.
+ */
+export function isSemanticObjectEntry(entry: Entry): boolean {
+  return isModelEntry(entry) || isEntityEntry(entry) || isMetricEntry(entry) ||
+      entryTypeId(entry) === 'semantic-relationship';
+}
+
+/**
  * Returns true when `entry` is a `semantic-explore` entry.
  */
 export function isExploreEntry(entry: Entry): boolean {
@@ -139,17 +148,19 @@ export function isDependentEntry(entry: Entry): boolean {
 }
 
 /**
- * Returns true when `link` is a model relationship entry link (`schema-join`
- * in V1 or `semantic-relationship` in V2).
+ * Returns true when `link` is of a kind push writes for a model: `schema-join`
+ * in V1, and in V2 `semantic-link` or a `reference` link whose ID starts with
+ * `semantic-relationship-` or `semantic-extends-`.
  *
- * Includes both V1 (`schema-join`) and V2 (`semantic-relationship`) regardless
- * of `v2Aspects`, so a model pushed with V1 and then V2 still discovers and
- * cleans up its old `schema-join` links without passing `semantic-relationship`
- * in a server-side `lookupEntryLinks` filter.
+ * Includes both V1 and V2 regardless of `v2Aspects`, so a model pushed with V1
+ * and then V2 still discovers and cleans up its old `schema-join` links
+ * without passing a link type in a server-side `lookupEntryLinks` filter.
  */
-export function isRelationshipLink(link: EntryLink): boolean {
+export function isModelLink(link: EntryLink): boolean {
   const type = linkTypeId(link);
-  return type === 'schema-join' || type === 'semantic-relationship';
+  return type === 'schema-join' || type === 'semantic-link' ||
+      (type === 'reference' &&
+       /^semantic-(relationship|extends)-/.test(linkId(link)));
 }
 
 // ---------------------------------------------------------------------------
@@ -249,27 +260,36 @@ function systemTypeProjectAndLocation(
 /**
  * Returns the set of aspect keys to include when updating `entry`.
  *
- * Always includes every aspect key present on `entry.aspects` plus the
- * optional `<proj>.<loc>.guidelines` aspect. When `opts?.v2Aspects` is true:
+ * Includes every aspect key present on `entry.aspects` plus the optional
+ * `<proj>.<loc>.guidelines` aspect. When `opts?.v2Aspects` is true:
+ *   * Adds `<proj>.<loc>.semantic-extensions` and `<proj>.<loc>.overview` on
+ *     model, entity, metric and relationship entries, so Dataplex removes the
+ *     aspect when the object no longer has content for it.
  *   * Adds `<proj>.<loc>.sql-expressions` on entity and metric entries.
- *   * Adds `<proj>.<loc>.guidelines@*` on entity entries so Dataplex clears
- *     field-level `guidelines` aspects for columns whose instructions or
- *     fields were removed.
+ *   * Adds `<proj>.<loc>.<type>@*` for guidelines, semantic-extensions and
+ *     overview on entity entries, so Dataplex writes each field's instance
+ *     `entry` carries and removes the others. A field's own key is left out.
  */
 export function entryAspectKeys(
     entry: Entry, opts?: SystemTypeOptions): Set<string> {
   const {proj, loc} = systemTypeProjectAndLocation(opts);
   const keys = new Set([
-    ...Object.keys(entry.aspects ?? {}),
+    ...Object.keys(entry.aspects ?? {}).filter(key => !key.includes('@')),
     `${proj}.${loc}.guidelines`,
   ]);
   if (!opts?.v2Aspects) return keys;
 
+  if (isSemanticObjectEntry(entry)) {
+    keys.add(`${proj}.${loc}.semantic-extensions`);
+    keys.add(`${proj}.${loc}.overview`);
+  }
   if (isEntityEntry(entry) || isMetricEntry(entry)) {
     keys.add(`${proj}.${loc}.sql-expressions`);
   }
   if (isEntityEntry(entry)) {
-    keys.add(`${proj}.${loc}.guidelines@*`);
+    for (const type of ['guidelines', 'semantic-extensions', 'overview']) {
+      keys.add(`${proj}.${loc}.${type}@*`);
+    }
   }
   return keys;
 }

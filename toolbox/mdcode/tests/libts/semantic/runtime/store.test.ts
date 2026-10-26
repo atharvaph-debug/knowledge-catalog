@@ -18,10 +18,10 @@ import {SemanticModel} from '../../../../src/libts/semantic/ir';
 import {loadModels} from '../../../../src/libts/semantic/loader';
 import {AlloyDbDatabase, resolveStore, storeLine, withPrimaryInstance} from '../../../../src/libts/semantic/runtime/store';
 
-const DB = '//spanner.googleapis.com/projects/p/instances/i/databases/d';
-const DATASET = '//bigquery.googleapis.com/projects/p/datasets/s';
+const DB = 'spanner.googleapis.com/projects/p/instances/i/databases/d';
+const DATASET = 'bigquery.googleapis.com/projects/p/datasets/s';
 const PG =
-    '//alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/instances/i/databases/d';
+    'alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/instances/i/databases/d';
 
 function model(body: string): SemanticModel {
   const loaded = loadModels(
@@ -45,7 +45,7 @@ function bound(target: string, source: string): SemanticModel {
 describe('where a model says it lives', () => {
   test('the deployment target is the store, split into its parts', () => {
     const store =
-        resolveStore(bound(`${DB}/propertyGraphs/g`, `${DB}/tables/Customer`));
+        resolveStore(bound(`${DB}/graphs/g`, `${DB}/tables/Customer`));
     if ('error' in store) throw new Error(store.error);
     expect(store.kind).toBe('spanner');
     if (store.kind !== 'spanner') return;
@@ -53,23 +53,6 @@ describe('where a model says it lives', () => {
     expect(store.instance).toBe('i');
     expect(store.database).toBe('d');
     expect(store.name).toBe('projects/p/instances/i/databases/d');
-  });
-
-  // A resource name is the URI without the leading `//`, so a model written
-  // either way, or mixing the two, runs against the same store, and its table
-  // is in that store rather than reported as bound elsewhere.
-  test('a target and a source written as resource names give the same store', () => {
-    const name = DB.slice(2);
-    for (const [target, source] of [
-           [`${name}/propertyGraphs/g`, `${name}/tables/Customer`],
-           [`${DB}/propertyGraphs/g`, `${name}/tables/Customer`],
-           [`${name}/propertyGraphs/g`, `${DB}/tables/Customer`],
-         ]) {
-      const store = resolveStore(bound(target, source));
-      if ('error' in store) throw new Error(store.error);
-      expect(store.kind).toBe('spanner');
-      expect(store.name).toBe('projects/p/instances/i/databases/d');
-    }
   });
 
   test('a BigQuery target is a store like any other', () => {
@@ -104,7 +87,7 @@ describe('where a model says it lives', () => {
   test('one AlloyDB database named by both of its URIs is one store', () => {
     const byInstance = `      - {name: by_instance, target: "${PG}"}\n`;
     const byCluster =
-        `      - {name: by_cluster, target: "//alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/databases/d"}\n`;
+        `      - {name: by_cluster, target: "alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/databases/d"}\n`;
     for (const listed of [byInstance + byCluster, byCluster + byInstance]) {
       const store = resolveStore(model(
           `    deployments:\n` + listed +
@@ -125,7 +108,7 @@ describe('where a model says it lives', () => {
     const m = model(
         `    deployments:\n` +
         `      - {name: old, target: "${PG}", profile: legacy}\n` +
-        `      - {name: new, target: "//alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/databases/d"}\n` +
+        `      - {name: new, target: "alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/databases/d"}\n` +
         `    entities:\n` +
         `      - name: Customer\n` +
         `        primary_key: [id]\n` +
@@ -142,9 +125,8 @@ describe('where a model says it lives', () => {
   });
 
   // An AlloyDB target names a DATABASE, not a graph, because AlloyDB has no
-  // property-graph DDL to address. A URI carrying the graph segment the other
-  // two backends use names nothing that could be created, so it is not quietly
-  // accepted.
+  // property-graph DDL to address. A URI carrying a graph segment names
+  // nothing that could be created, so it is not quietly accepted.
   test('an AlloyDB target with a graph segment is not a target at all', () => {
     const store =
         resolveStore(bound(`${PG}/propertyGraphs/g`, `${PG}/tables/customer`));
@@ -177,9 +159,9 @@ describe('a binding that disagrees with the target', () => {
   test('an entity bound to another database is refused, and both are named',
        () => {
          const other =
-             '//spanner.googleapis.com/projects/p/instances/i/databases/other';
+             'spanner.googleapis.com/projects/p/instances/i/databases/other';
          const store = resolveStore(
-             bound(`${DB}/propertyGraphs/g`, `${other}/tables/Customer`));
+             bound(`${DB}/graphs/g`, `${other}/tables/Customer`));
          expect('error' in store).toBe(true);
          if (!('error' in store)) return;
          expect(store.error).toContain('databases/other');
@@ -189,10 +171,10 @@ describe('a binding that disagrees with the target', () => {
   test('an entity bound to another system is refused for the same reason',
        () => {
          const store = resolveStore(bound(
-             `${DB}/propertyGraphs/g`, `${DATASET}/tables/Customer`));
+             `${DB}/graphs/g`, `${DATASET}/tables/Customer`));
          expect('error' in store).toBe(true);
          if (!('error' in store)) return;
-         expect(store.error).toContain("'Customer' to p.s.Customer");
+         expect(store.error).toContain(`'Customer' to ${DATASET}/tables/Customer`);
          expect(store.error)
              .toContain('projects/p/instances/i/databases/d');
        });
@@ -202,7 +184,7 @@ describe('a binding that disagrees with the target', () => {
     // The statements report that themselves, naming the table they could not
     // find; refusing here would refuse a logical model for being logical.
     const store = resolveStore(model(
-        `    deployment_target: ${DB}/propertyGraphs/g\n` +
+        `    deployment_target: ${DB}/graphs/g\n` +
         `    entities:\n` +
         `      - name: Customer\n` +
         `        primary_key: [id]\n` +
@@ -217,9 +199,10 @@ describe('a binding that disagrees with the target', () => {
        () => {
          const store = resolveStore(bound(
              `${DATASET}/propertyGraphs/g`,
-             '//bigquery.googleapis.com/projects/p/datasets/raw/tables/customer'));
+             'bigquery.googleapis.com/projects/p/datasets/raw/tables/customer'));
          expect(store).toEqual({
-           error: expect.stringContaining("binds 'Customer' to p.raw.customer"),
+           error: expect.stringContaining(
+               "binds 'Customer' to bigquery.googleapis.com/projects/p/datasets/raw/tables/customer"),
          });
        });
 });
@@ -234,7 +217,7 @@ describe('a model that declares more than one deployment target', () => {
   // A vanilla model, whose targets sit in a GOOGLE block.
   function targets(uris: string[], source: string): SemanticModel {
     return {
-      ...bound(`${DB}/propertyGraphs/g`, source),
+      ...bound(`${DB}/graphs/g`, source),
       version: '0.2.0.dev0',
       deployments: undefined,
       customExtensions: [{
@@ -246,7 +229,7 @@ describe('a model that declares more than one deployment target', () => {
 
   test('Spanner alongside BigQuery resolves to the Spanner store', () => {
     const store = resolveStore(targets(
-        [`${DB}/propertyGraphs/g`, `${DATASET}/propertyGraphs/g`],
+        [`${DB}/graphs/g`, `${DATASET}/propertyGraphs/g`],
         `${DB}/tables/Customer`));
     if ('error' in store) throw new Error(store.error);
     expect(store.kind).toBe('spanner');
@@ -256,7 +239,7 @@ describe('a model that declares more than one deployment target', () => {
   test('two Spanner targets is ambiguous, and the message says which backend',
        () => {
          const store = resolveStore(targets(
-             [`${DB}/propertyGraphs/g`, `//spanner.googleapis.com/projects/p/instances/i/databases/d2/propertyGraphs/g`],
+             [`${DB}/graphs/g`, `spanner.googleapis.com/projects/p/instances/i/databases/d2/graphs/g`],
              `${DB}/tables/Customer`));
          expect('error' in store).toBe(true);
          if (!('error' in store)) return;
@@ -272,7 +255,7 @@ describe('a model that declares more than one deployment target', () => {
   // has to name both rather than reporting "2 Spanner" or picking a winner.
   test('Spanner alongside AlloyDB is ambiguous, and both are named', () => {
     const store = resolveStore(
-        targets([`${DB}/propertyGraphs/g`, PG], `${DB}/tables/Customer`));
+        targets([`${DB}/graphs/g`, PG], `${DB}/tables/Customer`));
     expect('error' in store).toBe(true);
     if (!('error' in store)) return;
     expect(store.error).toContain('1 Spanner and 1 AlloyDB');
@@ -291,7 +274,7 @@ describe('a model that declares more than one deployment target', () => {
 
   test('two BigQuery targets is ambiguous in the same way', () => {
     const store = resolveStore(targets(
-        [`${DATASET}/propertyGraphs/g`, `//bigquery.googleapis.com/projects/p/datasets/s2/propertyGraphs/g`],
+        [`${DATASET}/propertyGraphs/g`, `bigquery.googleapis.com/projects/p/datasets/s2/propertyGraphs/g`],
         `${DATASET}/tables/Customer`));
     expect('error' in store).toBe(true);
     if (!('error' in store)) return;
@@ -302,10 +285,10 @@ describe('a model that declares more than one deployment target', () => {
   // twice in a GOOGLE block is a duplicate, which every push refuses.
   test('one Spanner graph listed twice is a duplicate target', () => {
     const store = resolveStore(targets(
-        [`${DB}/propertyGraphs/g`, `${DB}/propertyGraphs/g`],
+        [`${DB}/graphs/g`, `${DB}/graphs/g`],
         `${DB}/tables/Customer`));
     expect('error' in store && store.error)
-        .toContain(`declares duplicate deployment target '${DB}/propertyGraphs/g'`);
+        .toContain(`declares duplicate deployment target '${DB}/graphs/g'`);
   });
 
   test('one AlloyDB URI listed twice is a duplicate target', () => {
@@ -351,20 +334,20 @@ describe('a model that declares more than one deployment target', () => {
   test('a GOOGLE block target in no accepted form is reported, alone or beside one that gives a store',
        () => {
          const typo =
-             '//spanner.googleapis.com/projects/p/instance/i/databases/d/propertyGraphs/g';
+             'spanner.googleapis.com/projects/p/instance/i/databases/d/graphs/g';
          const notAccepted = {
            error: `Model 'm': the GOOGLE custom_extension's ` +
                `'deploymentTargets' lists '${typo}', which is not a BigQuery ` +
                `graph, a Spanner graph or an AlloyDB database. Write a ` +
-               `resource URI: ` +
-               `'//bigquery.googleapis.com/projects/<p>/datasets/<d>/propertyGraphs/<g>', ` +
-               `'//spanner.googleapis.com/projects/<p>/instances/<i>/databases/<db>/propertyGraphs/<g>' ` +
-               `or '//alloydb.googleapis.com/projects/<p>/locations/<l>/clusters/<c>/databases/<db>'.`,
+               `GCP resource name: ` +
+               `'bigquery.googleapis.com/projects/<p>/datasets/<d>/propertyGraphs/<g>', ` +
+               `'spanner.googleapis.com/projects/<p>/instances/<i>/databases/<db>/graphs/<g>' ` +
+               `or 'alloydb.googleapis.com/projects/<p>/locations/<l>/clusters/<c>/databases/<db>'.`,
            named: true,
            rejected: true,
          };
          expect(resolveStore(targets(
-                    [`${DB}/propertyGraphs/g`, typo], `${DB}/tables/Customer`)))
+                    [`${DB}/graphs/g`, typo], `${DB}/tables/Customer`)))
              .toEqual(notAccepted);
          expect(resolveStore(targets([typo], `${DB}/tables/Customer`)))
              .toEqual(notAccepted);
@@ -374,9 +357,9 @@ describe('a model that declares more than one deployment target', () => {
              .toEqual({
                error: `Model 'm': the GOOGLE custom_extension's ` +
                    `'deploymentTargets' lists 'spanner:graph:p.regional-us.i.d.g', ` +
-                   `which is a Knowledge Catalog name. Write the resource URI ` +
-                   `instead: ` +
-                   `'//spanner.googleapis.com/projects/<p>/instances/<i>/databases/<db>/propertyGraphs/<g>'.`,
+                   `which is a Knowledge Catalog name. Write the GCP resource ` +
+                   `name instead: ` +
+                   `'spanner.googleapis.com/projects/<p>/instances/<i>/databases/<db>/graphs/<g>'.`,
                named: true,
                rejected: true,
              });
@@ -386,7 +369,7 @@ describe('a model that declares more than one deployment target', () => {
   test('a GOOGLE block whose data is not valid JSON is reported, not thrown',
        () => {
          const broken: SemanticModel = {
-           ...bound(`${DB}/propertyGraphs/g`, `${DB}/tables/Customer`),
+           ...bound(`${DB}/graphs/g`, `${DB}/tables/Customer`),
            deployments: undefined,
            customExtensions: [{vendorName: 'GOOGLE', data: '{not-json'}],
          };
@@ -403,9 +386,9 @@ describe('a model that declares more than one deployment target', () => {
 // for `default` when it names none. The runtime asks for one profile's store.
 describe('the store a profile uses', () => {
   const BQ_GRAPH = `${DATASET}/propertyGraphs/g`;
-  const SPANNER_GRAPH = `${DB}/propertyGraphs/g`;
+  const SPANNER_GRAPH = `${DB}/graphs/g`;
   const CLUSTER_DB =
-      '//alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/databases/d';
+      'alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/databases/d';
 
   function deployed(entries: string, source = ''): SemanticModel {
     return model(
@@ -477,8 +460,8 @@ describe('the store a profile uses', () => {
     const store = resolveStore(
         deployed(
             `      - {name: spanner_a, target: "${SPANNER_GRAPH}", profile: operational}\n` +
-            `      - {name: spanner_b, target: "${DB}2/propertyGraphs/g", profile: operational}\n` +
-            `      - {name: spanner_c, target: "${DB}3/propertyGraphs/g"}\n`),
+            `      - {name: spanner_b, target: "${DB}2/graphs/g", profile: operational}\n` +
+            `      - {name: spanner_c, target: "${DB}3/graphs/g"}\n`),
         'operational');
     expect('error' in store && store.error)
         .toContain(
@@ -510,7 +493,7 @@ describe('the store a profile uses', () => {
     const vanilla = vanillaModel({
       deployments: [
         {name: 'spanner_a', target: SPANNER_GRAPH},
-        {name: 'spanner_b', target: `${DB}2/propertyGraphs/g`},
+        {name: 'spanner_b', target: `${DB}2/graphs/g`},
       ],
     });
     const store = resolveStore(vanilla, 'default');
@@ -550,7 +533,7 @@ describe('the store a profile uses', () => {
   test('a deployment that names no destination is reported beside one that does',
        () => {
          const typo =
-             '//spanner.googleapis.com/projects/p/instance/i/databases/d/propertyGraphs/g';
+             'spanner.googleapis.com/projects/p/instance/i/databases/d/graphs/g';
          const store = resolveStore(
              deployed(
                  `      - {name: good, target: "${SPANNER_GRAPH}"}\n` +
@@ -569,8 +552,8 @@ describe('the store a profile uses', () => {
         deployed(`      - {name: prod, target: "${target}"}\n`), 'default');
     expect(store).toEqual({
       error: `Model 'm': deployment 'prod' targets '${target}', which is a ` +
-          `Knowledge Catalog name. Write the resource URI instead: ` +
-          `'//bigquery.googleapis.com/projects/<p>/datasets/<d>/propertyGraphs/<g>'.`,
+          `Knowledge Catalog name. Write the GCP resource name instead: ` +
+          `'bigquery.googleapis.com/projects/<p>/datasets/<d>/propertyGraphs/<g>'.`,
       named: true,
       rejected: true,
     });
@@ -582,7 +565,7 @@ describe('the store a profile uses', () => {
     const store = resolveStore(
         deployed(
             `      - {name: alloy_old, target: "${PG}"}\n`,
-            '//alloydb.googleapis.com/projects/p/locations/us-central1/' +
+            'alloydb.googleapis.com/projects/p/locations/us-central1/' +
                 'clusters/c/databases/d/schemas/public/tables/customer'),
         'default');
     if ('error' in store) throw new Error(store.error);
@@ -671,50 +654,9 @@ describe('the store a profile uses', () => {
 });
 
 
-// The loader keeps a Spanner or AlloyDB source written as a catalog name as
-// it was written, and the store reads it.
-describe('a catalog-name source', () => {
-  function sourced(target: string, source: string): SemanticModel {
-    return model(
-        `    deployments:\n` +
-        `      - {name: prod, target: "${target}"}\n` +
-        `    entities:\n` +
-        `      - name: Customer\n` +
-        `        primary_key: [id]\n` +
-        `        source: ${source}\n` +
-        `        fields:\n` +
-        `          - {name: id, datatype: Integer, expression: id}\n`);
-  }
-
-  const CLUSTER_DB =
-      '//alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/databases/d';
-
-  test('in Spanner matches a Spanner target', () => {
-    const store = resolveStore(sourced(
-        `${DB}/propertyGraphs/g`, 'spanner:p.regional-us-central1.i.d.Customer'));
-    if ('error' in store) throw new Error(store.error);
-    expect(store.name).toBe('projects/p/instances/i/databases/d');
-  });
-
-  test('in AlloyDB matches an AlloyDB target', () => {
-    const store = resolveStore(
-        sourced(CLUSTER_DB, 'alloydb:p.us-central1.c.d.public.customer'));
-    if ('error' in store) throw new Error(store.error);
-    expect(store.kind).toBe('alloydb');
-  });
-
-  test('in another database is refused', () => {
-    const store = resolveStore(sourced(
-        CLUSTER_DB, 'alloydb:p.us-central1.c.other.public.customer'));
-    expect('error' in store && store.error)
-        .toContain("'Customer' to alloydb:p.us-central1.c.other.public.customer");
-  });
-});
-
-
 describe('an AlloyDB source', () => {
   const CLUSTER =
-      '//alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c';
+      'alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c';
 
   function alloyModel(target: string, source: string): SemanticModel {
     return model(
@@ -728,7 +670,7 @@ describe('an AlloyDB source', () => {
         `          - {name: id, datatype: Integer, expression: id}\n`);
   }
 
-  test('written as a table URI, matches a target with the same cluster and database',
+  test('written as a table resource name, matches a target with the same cluster and database',
        () => {
          const store = resolveStore(alloyModel(
              `${CLUSTER}/databases/d`,
@@ -747,7 +689,7 @@ describe('an AlloyDB source', () => {
 
   // The instance is compute. The database belongs to the cluster, so a legacy
   // source's instance takes no part in the match.
-  test('written as a legacy instance URI, matches on cluster and database', () => {
+  test('written as a legacy instance-based name, matches on cluster and database', () => {
     const store = resolveStore(alloyModel(
         `${CLUSTER}/databases/d`,
         `${CLUSTER}/instances/any/databases/d/tables/customer`));

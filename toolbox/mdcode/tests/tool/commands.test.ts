@@ -22,7 +22,8 @@ import * as pullKc from '../../src/libts/semantic/pull_kc';
 import {createSemanticRuntimes} from '../../src/libts/semantic/runtime/runtime';
 import * as sqlParser from '../../src/libts/semantic/sql_parser';
 import * as validateMod from '../../src/libts/semantic/validate';
-import {kcV2Aspects, profiles, pull, push, PushOptions, skillsGenerate} from '../../src/tool/commands';
+import {kcV2Aspects, profiles, pull, push, skillsGenerate} from '../../src/tool/commands';
+import {passGraphChecks} from '../libts/mocks';
 
 const CTX = new ApiContext('test-project', 'us', 'test-token');
 
@@ -36,9 +37,18 @@ semantic_model:
           - { name: key, label: Customer ID }
 `;
 
+// Profile prod, which binds Customer to the prod table with its own key.
+const PROD_PROFILE = `name: prod
+entities:
+  - name: Customer
+    source: bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer
+    primary_key: [cust_key]
+    fields: [{ name: key, expression: cust_key }]
+`;
+
 let dir = '';
 let cwd = '';
-let savedEnv: string|undefined;
+let savedEnv: NodeJS.ProcessEnv = {};
 
 function writeWorkspace(): void {
   fs.writeFileSync(
@@ -49,11 +59,16 @@ function writeWorkspace(): void {
   fs.writeFileSync(path.join(eg, 'commerce.yaml'), MODEL_YAML);
 }
 
+// A model file's text without its deployments list. Push takes --no-kc,
+// --profile and --no-profile only for a model that lists no deployments.
+const withoutDeployments = (model: string) =>
+    model.replace(/ {4}deployments:\n.*\n.*\n/, '');
+
 beforeEach(() => {
   cwd = process.cwd();
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kcmd-commands-'));
   process.chdir(dir);
-  savedEnv = process.env.KC_V2_ASPECTS;
+  savedEnv = {...process.env};
   delete process.env.KC_V2_ASPECTS;
   spyOn(ApiContext, 'default').mockReturnValue(CTX);
   spyOn(console, 'log').mockImplementation(() => {});
@@ -68,13 +83,13 @@ beforeEach(() => {
       .mockResolvedValue({status: 200, result: {}} as any);
   spyOn(CatalogClient.prototype, 'getAspectType')
       .mockResolvedValue({status: 200, result: {}} as any);
+  passGraphChecks();
 });
 
 afterEach(() => {
-  if (savedEnv === undefined) {
-    delete process.env.KC_V2_ASPECTS;
-  } else {
-    process.env.KC_V2_ASPECTS = savedEnv;
+  for (const k of ['KC_V2_ASPECTS', 'KC_TYPE_PROJECT']) {
+    if (savedEnv[k] === undefined) delete process.env[k];
+    else process.env[k] = savedEnv[k];
   }
   process.chdir(cwd);
   if (dir) fs.rmSync(dir, {recursive: true, force: true});
@@ -106,6 +121,12 @@ describe('push prints Knowledge Catalog warnings', () => {
     success: true, created: 1, updated: 0, deleted: 0, linked: 0, unlinked: 0,
     warnings: ['a relationship is skipped'], plan: [],
   };
+  // The model binds no table and declares no named profile, so push warns
+  // before it reaches the catalog.
+  const NON_EXECUTABLE = "Warning: model 'commerce' (commerce) is " +
+      "non-executable: the model file leaves entity 'Customer' without a " +
+      'source, and the model declares no named profile. It cannot be ' +
+      'queried until it is bound.';
 
   test('before the first catalog write, once each', async () => {
     writeWorkspace();
@@ -122,6 +143,7 @@ describe('push prints Knowledge Catalog warnings', () => {
 
     expect(await push({})).toBe(0);
     expect(events).toEqual([
+      NON_EXECUTABLE,
       'Warning: a relationship is skipped',
       'first catalog write',
     ]);
@@ -134,6 +156,7 @@ describe('push prints Knowledge Catalog warnings', () => {
 
     expect(await push({validateOnly: true})).toBe(0);
     expect(warn.mock.calls.map(c => String(c[0]))).toEqual([
+      NON_EXECUTABLE,
       'Warning: a relationship is skipped',
     ]);
   });
@@ -185,9 +208,10 @@ describe('v2Aspects forwarding', () => {
         expect(pullSpy.mock.calls[0][1].v2Aspects).toBe(false);
       });
 
-  test('pull forwards v2Aspects: true when KC_V2_ASPECTS is "1"', async () => {
+  test('pull forwards v2Aspects: true and KC_TYPE_PROJECT', async () => {
     writeWorkspace();
     process.env.KC_V2_ASPECTS = '1';
+    process.env.KC_TYPE_PROJECT = 'types';
     const pullSpy = spyOn(pullKc, 'pullKnowledgeCatalog')
                         .mockResolvedValue({models: [], warnings: []});
 
@@ -196,101 +220,16 @@ describe('v2Aspects forwarding', () => {
     expect(code).toBe(0);
     expect(pullSpy).toHaveBeenCalledTimes(1);
     expect(pullSpy.mock.calls[0][1].v2Aspects).toBe(true);
-  });
-});
-
-
-describe('a push with a sibling profile file', () => {
-  test('a graph push of the profile file is refused before anything deploys', async () => {
-    fs.writeFileSync(
-        path.join(dir, 'catalog.yaml'),
-        'scope: semantic-model.test-project.us.commerce_eg\n');
-    const eg = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
-    fs.mkdirSync(eg, {recursive: true});
-    fs.writeFileSync(path.join(eg, 'commerce.yaml'), `version: "0.2.0.dev0/google"
-semantic_model:
-  - name: commerce
-    deployments:
-      - name: prod
-        target: //bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g
-    entities:
-      - name: Customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/d/tables/customer
-        primary_key: [key]
-        fields:
-          - { name: key, expression: c_key }
-`);
-    fs.writeFileSync(path.join(eg, 'commerce.profile.prod.yaml'), `name: prod
-entities:
-  - name: Customer
-    source: //bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer
-`);
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
-
-    const code = await push({validateOnly: true, kc: false, profile: 'prod'});
-
-    expect(code).toBe(1);
-    expect(errorSpy.mock.calls.map(c => String(c[0])).join('\n'))
-        .toContain("binding profile 'prod' is a named profile, which names no deployment target");
-  });
-
-  test('when default_profile names the profile file, the refusal points at --profile default', async () => {
-    fs.writeFileSync(
-        path.join(dir, 'catalog.yaml'),
-        'scope: semantic-model.test-project.us.commerce_eg\ndefault_profile: prod\n');
-    const eg = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
-    fs.mkdirSync(eg, {recursive: true});
-    fs.writeFileSync(path.join(eg, 'commerce.yaml'), `version: "0.2.0.dev0/google"
-semantic_model:
-  - name: commerce
-    deployments:
-      - name: prod
-        target: //bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g
-    entities:
-      - name: Customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/d/tables/customer
-        primary_key: [key]
-        fields:
-          - { name: key, expression: c_key }
-`);
-    fs.writeFileSync(path.join(eg, 'commerce.profile.prod.yaml'), `name: prod
-entities:
-  - name: Customer
-    source: //bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer
-`);
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
-    spyOn(console, 'log').mockImplementation(() => {});
-    spyOn(validateMod, 'validateBigQueryDataSources').mockResolvedValue([]);
-    spyOn(validateMod, 'validateBigQueryActionStatements').mockResolvedValue([]);
-    const bqSpy = spyOn(bqLeg, 'deployBigQuery')
-                      .mockResolvedValue({deployed: 0, ddl: [], warnings: []} as any);
-
-    // Without --profile, push takes default_profile, the profile file.
-    expect(await push({validateOnly: true, kc: false})).toBe(1);
-    const refusal = errorSpy.mock.calls.map(c => String(c[0])).join('\n');
-    expect(refusal).toContain(
-        "Run 'kcmd push --profile default' to deploy the model file's own " +
-        "bindings, or 'kcmd push --no-profile' to publish to Knowledge " +
-        "Catalog without deploying a graph. Both need the model file's own " +
-        'bindings to be complete.');
-    expect(bqSpy).not.toHaveBeenCalled();
-
-    // The command it names deploys the model file's own bindings.
-    errorSpy.mockClear();
-    await push({validateOnly: true, kc: false, profile: 'default'});
-    expect(errorSpy.mock.calls.map(c => String(c[0])).join('\n'))
-        .not.toContain('is a named profile');
-    expect(bqSpy).toHaveBeenCalledTimes(1);
-    expect(bqSpy.mock.calls[0][0][0].model.entities?.[0].dataSource)
-        .toBe('test-project.d.customer');
+    expect(pullSpy.mock.calls[0][1].systemTypeProject).toBe('types');
   });
 });
 
 
 describe('push preflights under a legacy wrapper', () => {
   // Each live preflight gets documents labeled with the profile, so its errors
-  // name the profile that may have set the value they are about.
-  test('every preflight names the profile', async () => {
+  // name the profile that may have set the value they are about. Field ltv is
+  // unbound, so push prints a pruning note before a source check that fails.
+  test('every preflight names the profile, and a push whose source check fails still prints the pruning note', async () => {
     fs.writeFileSync(
         path.join(dir, 'catalog.yaml'),
         'scope: semantic-model.test-project.us.commerce_eg\n');
@@ -301,10 +240,12 @@ semantic_model:
   - name: commerce
     entities:
       - name: Customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/raw/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/raw/tables/customer
         primary_key: [key]
         fields:
           - { name: key, expression: c_key }
+          - { name: ltv }
+          - { name: odd, expression: "odd +* (" }
 `);
     const wrapper = (target: string, source: string) => `semantic_model:
   - name: commerce
@@ -314,11 +255,11 @@ semantic_model:
         source: ${source}
 `;
     fs.writeFileSync(path.join(eg, 'commerce.profiles', 'bq.yaml'), wrapper(
-        '//bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g',
-        '//bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer'));
+        'bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g',
+        'bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer'));
     fs.writeFileSync(path.join(eg, 'commerce.profiles', 'sp.yaml'), wrapper(
-        '//spanner.googleapis.com/projects/test-project/instances/i/databases/d/propertyGraphs/g',
-        '//spanner.googleapis.com/projects/test-project/instances/i/databases/d/tables/Customer'));
+        'spanner.googleapis.com/projects/test-project/instances/i/databases/d/graphs/g',
+        'spanner.googleapis.com/projects/test-project/instances/i/databases/d/tables/Customer'));
     const seen: Record<string, string[]> = {};
     const record = (name: string) => async (models: any[]) => {
       (seen[name] ??= []).push(...models.map(m => m.document));
@@ -339,6 +280,17 @@ semantic_model:
       bqDml: ["commerce, profile 'bq'"],
       spDml: ["commerce, profile 'sp'"],
     });
+    spyOn(validateMod, 'validateBigQueryDataSources').mockResolvedValue(['gone']);
+    const warn = spyOn(console, 'warn').mockClear();
+    const error = spyOn(console, 'error').mockClear();
+    expect(await push({validateOnly: true, kc: false, profile: 'bq'})).toBe(1);
+    expect(messages(error)).toBe('Error: gone');
+    expect(messages(warn).split('\n')).toEqual([
+      "Warning: field 'Customer.odd' in model 'commerce' (commerce, profile " +
+          "'bq'): kcmd could not read its SQL, so the fields it reads were " +
+          'not checked.',
+      "Note: profile 'bq' leaves 1 field(s) unbound.",
+    ]);
   });
 });
 
@@ -348,7 +300,7 @@ describe('a catalog-only push with a sibling profile file', () => {
     success: true, created: 0, updated: 0, deleted: 0, linked: 0, unlinked: 0,
     warnings: [], plan: [], details: '',
   } as any;
-  const setup = (deployment: string, entities: string) => {
+  const setup = (entities: string) => {
     fs.writeFileSync(
         path.join(dir, 'catalog.yaml'),
         'scope: semantic-model.test-project.us.commerce_eg\ndefault_profile: prod\n');
@@ -357,43 +309,22 @@ describe('a catalog-only push with a sibling profile file', () => {
     fs.writeFileSync(path.join(eg, 'commerce.yaml'), `version: "0.2.0.dev0/google"
 semantic_model:
   - name: commerce
-${deployment}    entities:
+    entities:
 ${entities}`);
-    fs.writeFileSync(path.join(eg, 'commerce.profile.prod.yaml'), `name: prod
-entities:
-  - name: Customer
-    source: //bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer
-`);
+    fs.writeFileSync(path.join(eg, 'commerce.profile.prod.yaml'), PROD_PROFILE);
   };
   const CUSTOMER = `      - name: Customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/raw/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/raw/tables/customer
         primary_key: [key]
         fields:
           - { name: key, expression: c_key }
 `;
 
-  // `--no-profile` publishes the default binding, here the profile file, and
-  // the model it gives keeps the model file's deployments.
-  test('the deployment-profile check covers the model a profile file gives', async () => {
-    setup(`    deployments:
-      - name: g
-        target: //bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g
-        profile: prod
-`, CUSTOMER);
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
-    const deploySpy = spyOn(kc, 'deployKnowledgeCatalog').mockResolvedValue(KC_OK);
-
-    expect(await push({validateOnly: true, profile: false})).toBe(1);
-    expect(deploySpy).not.toHaveBeenCalled();
-    expect(errorSpy.mock.calls.map(c => String(c[0])).join('\n'))
-        .toContain("deployment 'g' names profile 'prod'");
-  });
-
   // A named profile binds every concrete entity, whether or not a push
   // deploys it, so an entity the profile file leaves without a source stops a
   // catalog-only push too.
   test('an entity left without a source stops a catalog-only push', async () => {
-    setup('', CUSTOMER + `      - name: Orders
+    setup(CUSTOMER + `      - name: Orders
         primary_key: [id]
         fields:
           - { name: id, expression: o_id }
@@ -421,20 +352,13 @@ semantic_model:
   - name: commerce
     entities:
       - name: Customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/raw/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/raw/tables/customer
         fields:
           - { name: key, expression: c_key }
           - { name: credit, expression: c_credit }
 `);
-    fs.writeFileSync(path.join(eg, 'commerce.profile.prod.yaml'), `name: prod
-entities:
-  - name: Customer
-    source: //bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer
-    primary_key: [cust_key]
-    fields:
-      - { name: key, expression: cust_key }
-    fields_exclude: [credit]
-`);
+    fs.writeFileSync(path.join(eg, 'commerce.profile.prod.yaml'),
+                     `${PROD_PROFILE}    fields_exclude: [credit]\n`);
     const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
     const deploySpy = spyOn(kc, 'deployKnowledgeCatalog');
 
@@ -473,15 +397,12 @@ semantic_model:
   - name: commerce
     entities:
       - name: Customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/raw/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/raw/tables/customer
         fields:
           - { name: key, expression: c_key }
 `);
-    fs.writeFileSync(path.join(eg, 'commerce.profile.prod.yaml'), `name: prod
-entities:
-  - name: Customer
-    source: //bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer
-`);
+    fs.writeFileSync(path.join(eg, 'commerce.profile.prod.yaml'),
+                     PROD_PROFILE.replace('    primary_key: [cust_key]\n', ''));
     const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
     spyOn(kc, 'deployKnowledgeCatalog');
 
@@ -502,7 +423,7 @@ describe('a push prints warnings in document order', () => {
     const eg = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
     fs.mkdirSync(path.join(eg, 'a.profiles'), {recursive: true});
     const BQ = (t: string) =>
-        `//bigquery.googleapis.com/projects/test-project/datasets/raw/tables/${t}`;
+        `bigquery.googleapis.com/projects/test-project/datasets/raw/tables/${t}`;
     const keyless = (name: string) => `version: "0.2.0.dev0/google"
 semantic_model:
   - name: ${name}
@@ -521,7 +442,8 @@ semantic_model:
         source: ${BQ('a2')}
 `);
     fs.writeFileSync(path.join(eg, 'b.profile.prod.yaml'),
-                     `name: prod\nentities:\n  - name: X\n    source: ${BQ('b2')}\n`);
+                     `name: prod\nentities:\n  - name: X\n    source: ${BQ('b2')}\n` +
+                         '    fields:\n      - { name: id, expression: id }\n');
     const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
     spyOn(console, 'error').mockImplementation(() => {});
     spyOn(kc, 'deployKnowledgeCatalog');
@@ -549,12 +471,12 @@ semantic_model:
   - name: commerce
     entities:
       - name: Customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/raw/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/raw/tables/customer
         primary_key: [c_key]
         fields:
           - { name: key, expression: c_key }
       - name: Order
-        source: //bigquery.googleapis.com/projects/test-project/datasets/raw/tables/orders
+        source: bigquery.googleapis.com/projects/test-project/datasets/raw/tables/orders
         primary_key: [o_key]
         fields:
           - { name: key, expression: o_key }
@@ -570,12 +492,7 @@ semantic_model:
 
   // The profile's key leaves the relationship's to_columns covering none.
   test('a key the profile sets', async () => {
-    writeModel(`name: prod
-entities:
-  - name: Customer
-    source: //bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer
-    primary_key: [cust_id]
-`);
+    writeModel(PROD_PROFILE.replaceAll('cust_key', 'cust_id'));
     const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
     const code = await push({validateOnly: true, profile: 'prod'});
@@ -666,7 +583,7 @@ describe('a catalog-only push of a profile file loads the model file alone', () 
     const eg = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
     fs.mkdirSync(eg, {recursive: true});
     const BQ = (t: string) =>
-        `//bigquery.googleapis.com/projects/test-project/datasets/raw/tables/${t}`;
+        `bigquery.googleapis.com/projects/test-project/datasets/raw/tables/${t}`;
     fs.writeFileSync(path.join(eg, 'commerce.yaml'), `version: "0.2.0.dev0/google"
 semantic_model:
   - name: commerce
@@ -719,17 +636,14 @@ describe('a model with a Spanner graph target is pruned in the Spanner dialect',
     const eg = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
     fs.mkdirSync(path.join(eg, 'commerce.profiles'), {recursive: true});
     const table =
-        '//bigquery.googleapis.com/projects/test-project/datasets/ds/tables/orders';
+        'bigquery.googleapis.com/projects/test-project/datasets/ds/tables/orders';
     const spGraph =
-        '//spanner.googleapis.com/projects/test-project/instances/i/databases/db/propertyGraphs/g';
+        'spanner.googleapis.com/projects/test-project/instances/i/databases/db/graphs/g';
     const bqGraph =
-        '//bigquery.googleapis.com/projects/test-project/datasets/ds/propertyGraphs/g';
+        'bigquery.googleapis.com/projects/test-project/datasets/ds/propertyGraphs/g';
     fs.writeFileSync(path.join(eg, 'commerce.yaml'), `version: "0.2.0.dev0/google"
 semantic_model:
   - name: commerce
-    deployments:
-      - { name: sp, target: "${spGraph}" }
-      - { name: bq, target: "${bqGraph}", profile: bqprof }
     entities:
       - name: orders
         source: ${table}
@@ -749,9 +663,6 @@ semantic_model:
                 - { dialect: SPANNER, expression: "orders.gross" }
                 - { dialect: ANSI_SQL, expression: "orders.gross - orders.tax" }
 `);
-    // Push refuses a deployment that names a profile. spprof's
-    // deployment_target replaces the model file's deployments, so a push of
-    // spprof never reads the one that names bqprof.
     fs.writeFileSync(path.join(eg, 'commerce.profiles', 'spprof.yaml'), `semantic_model:
   - name: commerce
     deployment_target: ${spGraph}
@@ -761,6 +672,7 @@ semantic_model:
 `);
     fs.writeFileSync(path.join(eg, 'commerce.profiles', 'bqprof.yaml'), `semantic_model:
   - name: commerce
+    deployment_target: ${bqGraph}
     entities:
       - name: orders
         source: ${table}
@@ -804,21 +716,19 @@ describe('a pruned push checks the sources a profile file leaves out', () => {
     fs.writeFileSync(path.join(eg, 'a.yaml'), `version: "0.2.0.dev0/google"
 semantic_model:
   - name: a
-    deployments:
-      - name: g
-        target: //spanner.googleapis.com/${SPANNER}/propertyGraphs/g
     entities:
       - name: X
-        source: //spanner.googleapis.com/${SPANNER}/tables/X
+        source: spanner.googleapis.com/${SPANNER}/tables/X
         primary_key: [id]
         fields:
           - { name: id, expression: id }
 `);
     fs.writeFileSync(path.join(eg, 'a.profiles', 'prod.yaml'), `semantic_model:
   - name: a
+    deployment_target: spanner.googleapis.com/${SPANNER}/graphs/g
     entities:
       - name: X
-        source: //spanner.googleapis.com/${SPANNER}/tables/X2
+        source: spanner.googleapis.com/${SPANNER}/tables/X2
 `);
     fs.writeFileSync(path.join(eg, 'b.yaml'), `version: "0.2.0.dev0/google"
 semantic_model:
@@ -862,19 +772,20 @@ semantic_model:
   - name: commerce
     deployments:
       - name: prod
-        target: //bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g
+        target: bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g
     entities:
       - name: customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/d/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/d/tables/customer
         primary_key: [id]
         fields:
           - { name: id, datatype: Integer, expression: id }
           - { name: name, datatype: String, expression: cust_name }
       - name: vip
         extends: [customer]
-        source: //bigquery.googleapis.com/projects/test-project/datasets/d/tables/vip
+        source: bigquery.googleapis.com/projects/test-project/datasets/d/tables/vip
         primary_key: [id]
         fields:
+          - { name: id, expression: id }
           - { name: name, datatype: Integer, description: VIP name }
 `;
 
@@ -887,7 +798,7 @@ semantic_model:
     fs.writeFileSync(path.join(eg, 'commerce.yaml'), GRAPH_MODEL);
     const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
-    const code = await push({validateOnly: true, kc: false});
+    const code = await push({validateOnly: true});
 
     expect(code).toBe(1);
     expect(errorSpy.mock.calls.map(c => String(c[0])).join('\n'))
@@ -900,13 +811,15 @@ semantic_model:
         'scope: semantic-model.test-project.us.commerce_eg\n');
     const eg = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
     fs.mkdirSync(path.join(eg, 'commerce.profiles'), {recursive: true});
-    fs.writeFileSync(path.join(eg, 'commerce.yaml'), GRAPH_MODEL);
+    fs.writeFileSync(path.join(eg, 'commerce.yaml'),
+                     withoutDeployments(GRAPH_MODEL));
     fs.writeFileSync(
         path.join(eg, 'commerce.profiles', 'legacy.yaml'), `semantic_model:
   - name: commerce
+    deployment_target: bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g
     entities:
       - name: customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/d2/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/d2/tables/customer
 `);
     const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
     spyOn(console, 'warn').mockImplementation(() => {});
@@ -930,10 +843,10 @@ semantic_model:
   - name: commerce
     deployments:
       - name: default
-        target: //bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g
+        target: bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g
     entities:
       - name: customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/d/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/d/tables/customer
         primary_key: [id]
         fields:
           - { name: id, datatype: Integer, expression: id }
@@ -947,7 +860,7 @@ semantic_model:
 `);
     const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
-    const code = await push({validateOnly: true, kc: false});
+    const code = await push({validateOnly: true});
 
     expect(code).toBe(1);
     expect(errorSpy.mock.calls.map(c => String(c[0])).join('\n'))
@@ -961,10 +874,10 @@ semantic_model:
 semantic_model:
   - name: commerce
     deployments:
-      - { name: default, target: //bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g }
+      - { name: default, target: bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g }
     entities:
       - name: customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/d/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/d/tables/customer
         primary_key: [id]
         fields: [{ name: id, datatype: Integer, expression: id }]
     metrics:
@@ -998,7 +911,7 @@ semantic_model:
           return origPushReqs(...args);
         });
 
-    expect(await push({validateOnly: true, kc: false})).toBe(0);
+    expect(await push({validateOnly: true})).toBe(0);
     expect(warnSpy.mock.calls.map(c => String(c[0])).filter(m => m.includes('could not read its SQL')))
         .toEqual([
           "Warning: metric 'broken_metric' in model 'commerce' (commerce): kcmd " +
@@ -1009,6 +922,9 @@ semantic_model:
     expect(order).toEqual([
       'loadSqlEngine',
       'loadSemanticModels',
+      'validateExpressionReferences',
+      // The catalog's model, then the deployment's.
+      'validatePushRequirements',
       'validateExpressionReferences',
       'validateExpressionReferences',
       'validatePushRequirements',
@@ -1038,21 +954,16 @@ semantic_model:
     name: commerce
     deployments:
       - name: prod
-        target: //bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g
+        target: bigquery.googleapis.com/projects/test-project/datasets/d/propertyGraphs/g
     entities:
       - name: Customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/d/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/d/tables/customer
         primary_key: [key]
         fields:
           - { name: key, expression: c_key }   # flow style
 `;
 
-const ROUND_TRIP_PROFILE = `# Production bindings.
-name: prod
-entities:
-  - name: Customer
-    source: //bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer
-`;
+const ROUND_TRIP_PROFILE = `# Production bindings.\n${PROD_PROFILE}`;
 
 function entryGroupDir(): string {
   return path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg');
@@ -1121,6 +1032,8 @@ function fakeCatalog(opts: {missingType?: string} = {}) {
       });
   spyOn(P, 'lookupEntryLinks')
       .mockImplementation(async () => ({status: 200, result: []}));
+  spyOn(P, 'createEntryLink')
+      .mockResolvedValue({status: 200, result: {}} as any);
   return {entries, create, list, entryType, aspectType};
 }
 
@@ -1135,6 +1048,15 @@ function storedCopies(entries: Map<string, Entry>): Record<string, string> {
   return out;
 }
 
+// Mocks the BigQuery leg's live checks and deploy, and returns the deploy's
+// mock.
+function mockBigQuery() {
+  spyOn(validateMod, 'validateBigQueryDataSources').mockResolvedValue([]);
+  spyOn(validateMod, 'validateBigQueryActionStatements').mockResolvedValue([]);
+  return spyOn(bqLeg, 'deployBigQuery').mockResolvedValue(
+      {success: true, deployed: 1, ddl: [], warnings: []} as any);
+}
+
 function messages(spy: any): string {
   return spy.mock.calls.map((c: any[]) => c.map(String).join(' ')).join('\n');
 }
@@ -1144,12 +1066,7 @@ describe('the file copy round trip', () => {
        async () => {
          writeRoundTripWorkspace();
          const {entries} = fakeCatalog();
-         spyOn(validateMod, 'validateBigQueryDataSources').mockResolvedValue([]);
-         spyOn(validateMod, 'validateBigQueryActionStatements')
-             .mockResolvedValue([]);
-         spyOn(bqLeg, 'deployBigQuery')
-             .mockResolvedValue(
-                 {success: true, deployed: 1, ddl: [], warnings: []} as any);
+         mockBigQuery();
 
          expect(await push({})).toBe(0);
          expect(Object.keys(storedCopies(entries)).sort()).toEqual([
@@ -1173,11 +1090,13 @@ describe('the file copy round trip', () => {
 
   test('a push with --no-profile still stores the profile copies', async () => {
     writeRoundTripWorkspace();
+    const model = withoutDeployments(ROUND_TRIP_MODEL);
+    fs.writeFileSync(path.join(entryGroupDir(), 'commerce.yaml'), model);
     const {entries} = fakeCatalog();
 
     expect(await push({profile: false})).toBe(0);
     expect(storedCopies(entries)).toEqual({
-      'commerce.yaml': ROUND_TRIP_MODEL,
+      'commerce.yaml': model,
       'commerce.profile.prod.yaml': ROUND_TRIP_PROFILE,
     });
   });
@@ -1188,7 +1107,7 @@ describe('the file copy round trip', () => {
          const {create} = fakeCatalog({missingType: 'semantic-model-file'});
          const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
-         expect(await push({profile: false})).toBe(1);
+         expect(await push({deployment: false})).toBe(1);
          expect(messages(errorSpy))
              .toContain(
                  'Custom type \'semantic-model-file\' not found in project ' +
@@ -1210,7 +1129,7 @@ describe('the file copy round trip', () => {
          for (const validateOnly of [true, false]) {
            const errorSpy =
                spyOn(console, 'error').mockImplementation(() => {});
-           expect(await push({profile: false, validateOnly})).toBe(1);
+           expect(await push({deployment: false, validateOnly})).toBe(1);
            expect(messages(errorSpy)).toContain('bogus');
            expect(messages(errorSpy)).not.toContain('not found in project');
          }
@@ -1226,7 +1145,7 @@ describe('the file copy round trip', () => {
          const {create, list} = fakeCatalog();
          const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
-         expect(await push({profile: false})).toBe(1);
+         expect(await push({deployment: false})).toBe(1);
          expect(messages(errorSpy))
              .toContain(
                  'file \'commerce.profile.prod.yaml\' is too large to store ' +
@@ -1245,7 +1164,7 @@ semantic_model:
   - name: commerce
     entities:
       - name: Customer
-        source: //bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer
+        source: bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer
 `;
     writeRoundTripWorkspace();
     fs.rmSync(path.join(entryGroupDir(), 'commerce.profile.prod.yaml'));
@@ -1254,7 +1173,7 @@ semantic_model:
     fs.writeFileSync(legacyPath, legacy);
     const {entries} = fakeCatalog();
 
-    expect(await push({profile: false})).toBe(0);
+    expect(await push({deployment: false})).toBe(0);
     expect(Object.keys(storedCopies(entries)).sort())
         .toEqual(['commerce.profiles/prod.yaml', 'commerce.yaml']);
 
@@ -1267,13 +1186,13 @@ semantic_model:
        async () => {
          writeRoundTripWorkspace();
          const {entries} = fakeCatalog();
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
 
          const changed = ROUND_TRIP_MODEL.replace(
              'Orders and customers', 'Orders and their customers');
          fs.writeFileSync(path.join(entryGroupDir(), 'commerce.yaml'), changed);
          fs.rmSync(path.join(entryGroupDir(), 'commerce.profile.prod.yaml'));
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
 
          expect(storedCopies(entries)).toEqual({'commerce.yaml': changed});
        });
@@ -1290,7 +1209,7 @@ semantic_model:
          fs.writeFileSync(shop, ROUND_TRIP_MODEL);
          const {entries} = fakeCatalog();
          const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
          expect(Object.keys(storedCopies(entries))).toEqual(['shop.yaml']);
 
          fs.rmSync(shop);
@@ -1303,19 +1222,66 @@ semantic_model:
          expect(fs.readFileSync(rebuilt, 'utf8')).toContain('name: commerce');
        });
 
-  // Push still reads each profile file, to check it.
-  test('with KC_V2_ASPECTS on, push stores no copy', async () => {
-    process.env.KC_V2_ASPECTS = '1';
-    writeRoundTripWorkspace();
-    const {entries} = fakeCatalog();
-    expect(await push({profile: false})).toBe(0);
-    expect(storedCopies(entries)).toEqual({});
+  // Push still reads each profile file, to check it. Both push paths write
+  // each overview sidecar into its entry's overview aspect, and a malformed
+  // sidecar stops them before they read the catalog. Today's path takes the
+  // model with no deployments list.
+  test('with KC_V2_ASPECTS on, push stores no copy and writes the overview ' +
+           'sidecars, with --no-deployment too; a malformed sidecar or ' +
+           'profile file fails it',
+       async () => {
+         process.env.KC_V2_ASPECTS = '1';
+         writeRoundTripWorkspace();
+         const write = (name: string, text: string) => {
+           fs.mkdirSync(path.dirname(path.join(entryGroupDir(), name)),
+                        {recursive: true});
+           fs.writeFileSync(path.join(entryGroupDir(), name), text);
+         };
+         write('commerce.overview.md',
+               '---\ncontentType: MARKDOWN\n---\n# Commerce\n');
+         const {entries, create, list} = fakeCatalog();
+         const pushes = [
+           {options: {profile: false},
+            model: withoutDeployments(ROUND_TRIP_MODEL)},
+           {options: {deployment: false}, model: ROUND_TRIP_MODEL},
+         ];
+         for (const {options, model} of pushes) {
+           write('commerce.yaml', model);
+           expect(await push(options)).toBe(0);
+           expect(storedCopies(entries)).toEqual({});
+           expect(entries
+                      .get('projects/test-project/locations/us/entryGroups/' +
+                           'commerce_eg/entries/commerce')!
+                      .aspects!['dataplex-types.global.overview'].data)
+               .toEqual({content: '# Commerce', contentType: 'MARKDOWN'});
+         }
 
-    writeRoundTripWorkspace('name: [unterminated\n');
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
-    expect(await push({profile: false})).toBe(1);
-    expect(messages(errorSpy)).toContain('commerce.profile.prod.yaml');
-  });
+         write('commerce/metrics/revenue.overview.md',
+               '---\ncontentType: TEXT\n---\nNet.\n');
+         const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+         for (const {options, model} of pushes) {
+           write('commerce.yaml', model);
+           list.mockClear();
+           create.mockClear();
+           errorSpy.mockClear();
+           expect(await push(options)).toBe(1);
+           expect(messages(errorSpy)).toBe(
+               'Error: Overview sidecar ' +
+               "'commerce/metrics/revenue.overview.md': contentType is " +
+               "MARKDOWN or HTML, not 'TEXT'.");
+           expect(list).not.toHaveBeenCalled();
+           expect(create).not.toHaveBeenCalled();
+         }
+
+         writeRoundTripWorkspace('name: [unterminated\n');
+         errorSpy.mockClear();
+         expect(await push({deployment: false})).toBe(1);
+         expect(messages(errorSpy)).toContain('commerce.profile.prod.yaml');
+         write('commerce.yaml', withoutDeployments(ROUND_TRIP_MODEL));
+         errorSpy.mockClear();
+         expect(await push({profile: false})).toBe(1);
+         expect(messages(errorSpy)).toContain('commerce.profile.prod.yaml');
+       });
 });
 
 
@@ -1530,6 +1496,8 @@ describe('pull with stored file copies', () => {
       'commerce.profiles/prod.yml',
       'commerce.profile.dev.yml',
       'commerce.yml',
+      // Only a second-generation pull writes overview sidecars.
+      'commerce/entities/Customer.overview.md',
     ];
     pulled([...names.map(fileName => ({fileName, content: 'x'})), MODEL_COPY]);
 
@@ -1537,6 +1505,10 @@ describe('pull with stored file copies', () => {
     for (const name of names) {
       expect(messages(warnSpy)).toContain(`skipped '${name}' from the catalog`);
     }
+    expect(messages(warnSpy)).toContain(
+        `pull writes only 'commerce.yaml', 'commerce.profile.<name>.yaml' ` +
+        `and 'commerce.profiles/<name>.yaml' inside the entry group ` +
+        `directory.`);
     expect(fs.existsSync(local('commerce.profiles'))).toBe(false);
     expect(fs.existsSync(local('commerce.yml'))).toBe(false);
   });
@@ -1682,18 +1654,86 @@ describe('pull with stored file copies', () => {
          expect(fs.existsSync(path.join(outside, 'prod.yaml'))).toBe(true);
        });
 
-  test('with KC_V2_ASPECTS on, pull leaves local profile files unnamed',
+  test('with KC_V2_ASPECTS on, a second-generation pull writes the model, ' +
+           'profile and sidecar files and names or deletes stale ones',
        async () => {
          process.env.KC_V2_ASPECTS = '1';
          withStaleProfile();
+         const staleSidecar = 'commerce/metrics/old.overview.md';
+         fs.mkdirSync(path.dirname(local(staleSidecar)), {recursive: true});
+         fs.writeFileSync(local(staleSidecar), 'Old.\n');
          const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
-         spyOn(pullKc, 'pullKnowledgeCatalog')
-             .mockResolvedValue({models: [COMMERCE], warnings: []});
+         const model: SemanticModel = {...COMMERCE, profiles: [{
+           name: 'prod', entities: [], relationships: [], metricsExclude: '*'}],
+           entities: [{
+             name: 'Customer', dataSource: '', keys: [], fields: [{name: 'id'}],
+           }]};
+         const pulled = spyOn(pullKc, 'pullKnowledgeCatalog')
+                            .mockResolvedValue({models: [model], warnings: []});
 
          expect(await pull({forceRemove: true})).toBe(0);
          expect(messages(warnSpy)).not.toContain('profile file');
          expect(fs.existsSync(local('commerce.profile.dev.yaml'))).toBe(true);
-         expect(fs.existsSync(local('commerce.profile.prod.yaml'))).toBe(true);
+         expect(fs.readFileSync(local('commerce.profile.prod.yaml'), 'utf8'))
+             .toBe('name: prod\n');
+
+         const overviews = new Map([
+           ['commerce', {content: '# Commerce\n', contentType: 'HTML',
+                         links: [{url: 'https://x.test'}]}],
+           ['commerce/entities/Customer', {content: 'A buyer.\n'}],
+           ['commerce/metrics/Revenue', {content: 'Money in.\n'}],
+           ['commerce/relationships/placed', {content: 'Orders.\n'}],
+           // Push reads no sidecar at these paths.
+           ['commerce/notes/x', {content: 'x\n'}],
+           ['commerce/entities/a/b', {content: 'x\n'}],
+         ]);
+         pulled.mockResolvedValue(
+             {models: [model], warnings: [], secondGeneration: true, overviews});
+         // The catalog holds no profile's actions, so the local ones stay.
+         const actions = [{name: 'refund', executor: null}];
+         fs.writeFileSync(local('commerce.profile.prod.yaml'),
+                          'name: prod\nactions: [{name: refund, executor: null}]\n');
+         const {files} = osi.serializeModelFiles(
+             {...model, profiles: [{...model.profiles![0], actions}]});
+         warnSpy.mockClear();
+         expect(await pull()).toBe(0);
+         // Sources only in profile files draw no missing-source warning.
+         expect(messages(warnSpy)).not.toMatch(/no source|no expression/);
+         expect(files).toHaveLength(2);
+         for (const [name, text] of [
+                ...files.map(f => [f.fileName, f.content]),
+                ['commerce.overview.md',
+                 '---\ncontentType: HTML\nlinks:\n  - url: https://x.test\n' +
+                     '---\n# Commerce\n'],
+                ['commerce/entities/Customer.overview.md', 'A buyer.\n'],
+                ['commerce/metrics/Revenue.overview.md', 'Money in.\n'],
+                ['commerce/relationships/placed.overview.md', 'Orders.\n'],
+              ]) {
+           expect(fs.readFileSync(local(name), 'utf8')).toBe(text);
+         }
+         for (const name of ['commerce/notes/x.overview.md',
+                             'commerce/entities/a/b.overview.md']) {
+           expect(fs.existsSync(local(name))).toBe(false);
+           expect(messages(warnSpy))
+               .toContain(`skipped '${name}' from the catalog`);
+         }
+         for (const [kind, name] of [['profile file', 'commerce.profile.dev.yaml'],
+                                     ['overview sidecar', staleSidecar]]) {
+           expect(messages(warnSpy))
+               .toContain(`local ${kind} ${shown(name)} is not in the catalog`);
+           expect(fs.existsSync(local(name))).toBe(true);
+         }
+
+         expect(await pull({forceRemove: true})).toBe(0);
+         expect(fs.existsSync(local('commerce.profile.dev.yaml'))).toBe(false);
+         expect(fs.existsSync(local(staleSidecar))).toBe(false);
+
+         // A vanilla model declares no action, so its profiles get none.
+         pulled.mockResolvedValue({models: [{...model, version: '0.2.0.dev0'}],
+                                   warnings: [], secondGeneration: true});
+         expect(await pull()).toBe(0);
+         expect(fs.readFileSync(local('commerce.yaml'), 'utf8'))
+             .not.toContain('refund');
        });
 });
 
@@ -1702,12 +1742,7 @@ describe('the file-copy type is checked before anything is written', () => {
   test('a graph push into a project without it deploys no graph', async () => {
     writeRoundTripWorkspace();
     const {create} = fakeCatalog({missingType: 'semantic-model-file'});
-    spyOn(validateMod, 'validateBigQueryDataSources').mockResolvedValue([]);
-    spyOn(validateMod, 'validateBigQueryActionStatements').mockResolvedValue([]);
-    const deployed =
-        spyOn(bqLeg, 'deployBigQuery')
-            .mockResolvedValue(
-                {success: true, deployed: 1, ddl: [], warnings: []} as any);
+    const deployed = mockBigQuery();
     const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
     expect(await push({})).toBe(1);
@@ -1715,7 +1750,8 @@ describe('the file-copy type is checked before anything is written', () => {
         .toContain(
             'Error: Custom type \'semantic-model-file\' not found in project ' +
             '\'test-project\'; run \'kcmd init --semantic-model\' first.');
-    expect(deployed).not.toHaveBeenCalled();
+    // Push generates the graph's DDL first, which deploys nothing.
+    expect(deployed.mock.calls.map(c => c[2]?.validateOnly)).toEqual([true]);
     expect(create).not.toHaveBeenCalled();
   });
 
@@ -1724,7 +1760,7 @@ describe('the file-copy type is checked before anything is written', () => {
     fakeCatalog({missingType: 'semantic-model-file'});
     const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
-    expect(await push({validateOnly: true, profile: false})).toBe(1);
+    expect(await push({validateOnly: true, deployment: false})).toBe(1);
     expect(messages(errorSpy))
         .toContain(
             'Custom type \'semantic-model-file\' not found in project ' +
@@ -1740,13 +1776,13 @@ describe('the file-copy type is checked before anything is written', () => {
         spy => spy.mock.calls.filter(c => c[2] === 'semantic-model-file')
                    .length);
 
-    expect(await push({profile: false})).toBe(0);
+    expect(await push({deployment: false})).toBe(0);
     expect(Object.keys(storedCopies(entries))).toHaveLength(2);
     expect(lookups()).toEqual([1, 1]);
 
     entryType.mockClear();
     aspectType.mockClear();
-    expect(await push({validateOnly: true, profile: false})).toBe(0);
+    expect(await push({validateOnly: true, deployment: false})).toBe(0);
     expect(lookups()).toEqual([1, 1]);
   });
 
@@ -1756,26 +1792,13 @@ describe('the file-copy type is checked before anything is written', () => {
          writeRoundTripWorkspace();
          const lookup = spyOn(CatalogClient.prototype, 'getEntryType');
 
-         expect(await push({validateOnly: true, profile: false})).toBe(0);
+         expect(await push({validateOnly: true, deployment: false})).toBe(0);
          expect(lookup).not.toHaveBeenCalled();
        });
 });
 
 
 describe('push checks each file before anything is stored', () => {
-  test('a --no-profile push applies the profile file rules', async () => {
-    writeRoundTripWorkspace('name: staging\n');
-    const {create} = fakeCatalog();
-    const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
-
-    expect(await push({profile: false})).toBe(1);
-    expect(messages(errorSpy))
-        .toContain(
-            'Error: Profile file \'commerce.profile.prod.yaml\' declares name ' +
-            '\'staging\', which does not match filename suffix \'prod\'.');
-    expect(create).not.toHaveBeenCalled();
-  });
-
   test('a profile file that is not valid UTF-8 fails the push, naming it',
        async () => {
          writeRoundTripWorkspace();
@@ -1789,7 +1812,7 @@ describe('push checks each file before anything is stored', () => {
          const {create} = fakeCatalog();
          const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
-         expect(await push({profile: false})).toBe(1);
+         expect(await push({deployment: false})).toBe(1);
          expect(messages(errorSpy))
              .toContain(
                  'Error: File \'commerce.profile.prod.yaml\' is not valid ' +
@@ -1808,7 +1831,7 @@ describe('push checks each file before anything is stored', () => {
     fakeCatalog();
     const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
-    expect(await push({profile: false})).toBe(1);
+    expect(await push({deployment: false})).toBe(1);
     expect(messages(errorSpy))
         .toContain('Error: File \'commerce.yaml\' is not valid UTF-8');
   });
@@ -1818,7 +1841,7 @@ describe('push checks each file before anything is stored', () => {
     writeRoundTripWorkspace(profile);
     const {entries} = fakeCatalog();
 
-    expect(await push({profile: false})).toBe(0);
+    expect(await push({deployment: false})).toBe(0);
     expect(storedCopies(entries)['commerce.profile.prod.yaml']).toBe(profile);
   });
 
@@ -1849,13 +1872,7 @@ describe('push checks each file before anything is stored', () => {
       writeRoundTripWorkspace();
       setup();
       const {create} = fakeCatalog();
-      spyOn(validateMod, 'validateBigQueryDataSources').mockResolvedValue([]);
-      spyOn(validateMod, 'validateBigQueryActionStatements')
-          .mockResolvedValue([]);
-      const deployed =
-          spyOn(bqLeg, 'deployBigQuery')
-              .mockResolvedValue(
-                  {success: true, deployed: 1, ddl: [], warnings: []} as any);
+      const deployed = mockBigQuery();
       const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
       expect(await push({})).toBe(1);
@@ -1872,7 +1889,7 @@ describe('push checks each file before anything is stored', () => {
          fakeCatalog();
          const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
-         expect(await push({validateOnly: true, profile: false})).toBe(1);
+         expect(await push({validateOnly: true, deployment: false})).toBe(1);
          expect(messages(errorSpy))
              .toContain(
                  'file \'commerce.profile.prod.yaml\' is too large to store ' +
@@ -1890,7 +1907,7 @@ describe('push checks each file before anything is stored', () => {
          const {create} = fakeCatalog();
          const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
-         expect(await push({profile: false})).toBe(1);
+         expect(await push({deployment: false})).toBe(1);
          expect(messages(errorSpy))
              .toContain(
                  'Error: files \'commerce.profiles/a b.yaml\' and ' +
@@ -1913,7 +1930,7 @@ describe('push checks each file before anything is stored', () => {
          fakeCatalog();
          const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
 
-         expect(await push({profile: false})).toBe(1);
+         expect(await push({deployment: false})).toBe(1);
          const errors = messages(errorSpy);
          expect(errors).toContain(
              'entry group \'commerce_eg\' would receive 2 models');
@@ -1942,7 +1959,7 @@ describe('a model file not named after its model', () => {
          const {entries} = fakeCatalog();
          const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
 
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
          expect(warnSpy.mock.calls.map(c => String(c[0]))
                     .filter(w => w.includes('is not named')))
              .toEqual([NOTE]);
@@ -1955,12 +1972,12 @@ describe('a model file not named after its model', () => {
          writeRoundTripWorkspace();
          fakeCatalog();
          const warnSpy = spyOn(console, 'warn').mockImplementation(() => {});
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
 
          fs.rmSync(entryGroupDir(), {recursive: true});
          writeShop();
          process.env.KC_V2_ASPECTS = '1';
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
          expect(messages(warnSpy)).not.toContain('is not named');
        });
 });
@@ -2019,7 +2036,7 @@ describe('the push id on every file copy', () => {
          writeRoundTripWorkspace();
          const {entries} = fakeCatalog();
          failCopyWrites(entries);
-         expect(await push({profile: false})).toBe(1);
+         expect(await push({deployment: false})).toBe(1);
          expect(storedCopies(entries)).toEqual({});
 
          // A teammate's workspace, with another model file that
@@ -2043,13 +2060,13 @@ describe('the push id on every file copy', () => {
          fs.writeFileSync(
              shop, ROUND_TRIP_MODEL.replace('name: commerce', 'name: shop'));
          const {entries} = fakeCatalog();
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
 
          fs.rmSync(shop);
          fs.writeFileSync(
              path.join(entryGroupDir(), 'commerce.yaml'), ROUND_TRIP_MODEL);
          failCopyWrites(entries);
-         expect(await push({profile: false, forceRemove: true})).toBe(1);
+         expect(await push({deployment: false, forceRemove: true})).toBe(1);
          expect(storedCopies(entries)).toEqual({});
 
          const before = localFiles();
@@ -2066,7 +2083,7 @@ describe('the push id on every file copy', () => {
          writeRoundTripWorkspace();
          fs.rmSync(path.join(entryGroupDir(), 'commerce.profile.prod.yaml'));
          const {entries} = fakeCatalog();
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
 
          fs.writeFileSync(
              path.join(entryGroupDir(), 'commerce.yaml'),
@@ -2075,7 +2092,7 @@ describe('the push id on every file copy', () => {
              path.join(entryGroupDir(), 'commerce.profile.prod.yaml'),
              ROUND_TRIP_PROFILE);
          failCopyWrites(entries);
-         expect(await push({profile: false})).toBe(1);
+         expect(await push({deployment: false})).toBe(1);
          expect(Object.keys(storedCopies(entries))).toEqual(['commerce.yaml']);
 
          const before = localFiles();
@@ -2100,7 +2117,7 @@ describe('the push id on every file copy', () => {
          fs.writeFileSync(
              shop, ROUND_TRIP_MODEL.replace('name: commerce', 'name: shop'));
          const {entries} = fakeCatalog();
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
 
          fs.rmSync(shop);
          fs.writeFileSync(
@@ -2115,7 +2132,7 @@ describe('the push id on every file copy', () => {
                }
                return {status: 200};
              });
-         expect(await push({profile: false, forceRemove: true})).toBe(1);
+         expect(await push({deployment: false, forceRemove: true})).toBe(1);
          expect(entries.size).toBe(0);
 
          const before = localFiles();
@@ -2134,7 +2151,7 @@ describe('the push id on every file copy', () => {
          writeRoundTripWorkspace();
          const {entries} = fakeCatalog();
          failCopyWrites(entries, 'commerce.profile.prod.yaml');
-         expect(await push({profile: false})).toBe(1);
+         expect(await push({deployment: false})).toBe(1);
          expect(Object.keys(storedCopies(entries))).toEqual(['commerce.yaml']);
 
          const before = localFiles();
@@ -2148,13 +2165,13 @@ describe('the push id on every file copy', () => {
          writeRoundTripWorkspace();
          fs.rmSync(path.join(entryGroupDir(), 'commerce.profile.prod.yaml'));
          const {entries} = fakeCatalog();
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
 
          fs.writeFileSync(
              path.join(entryGroupDir(), 'commerce.profile.prod.yaml'),
              ROUND_TRIP_PROFILE);
          failCopyWrites(entries, 'commerce.profile.prod.yaml');
-         expect(await push({profile: false})).toBe(1);
+         expect(await push({deployment: false})).toBe(1);
 
          const before = localFiles();
          await expect(pull({forceRemove: true})).rejects.toThrow(PARTIAL);
@@ -2167,7 +2184,7 @@ describe('the push id on every file copy', () => {
          writeRoundTripWorkspace();
          const {entries} = fakeCatalog();
 
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
          const first = pushIds(entries);
          expect(Object.keys(first).sort()).toEqual([
            'commerce.profile.prod.yaml',
@@ -2183,7 +2200,7 @@ describe('the push id on every file copy', () => {
                .toBe(2);
          }
 
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
          const second = pushIds(entries);
          expect(second['commerce.profile.prod.yaml'])
              .toBe(second['commerce.yaml']);
@@ -2195,7 +2212,7 @@ describe('the push id on every file copy', () => {
        async () => {
          writeRoundTripWorkspace();
          const {entries} = fakeCatalog();
-         expect(await push({profile: false})).toBe(0);
+         expect(await push({deployment: false})).toBe(0);
 
          // The next push edits both files, and the profile copy's write fails.
          fs.writeFileSync(
@@ -2214,7 +2231,7 @@ describe('the push id on every file copy', () => {
                return {status: 200, result: entry};
              });
          const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
-         expect(await push({profile: false})).toBe(1);
+         expect(await push({deployment: false})).toBe(1);
          expect(messages(errorSpy))
              .toContain(
                  'The catalog may now lack some or all of this push\'s file ' +
@@ -2423,77 +2440,68 @@ describe('push applies, loads and checks a profile', () => {
   }
 
   // A model whose field 'customer.ltv' has no expression, with a BigQuery
-  // deployment for each name in `deployments`, and then the `rest` lines.
-  const ltvUnbound = (deployments: string[], rest = '') =>
+  // deployment for each name in `deployments`.
+  const ltvUnbound = (deployments: string[]) =>
       `version: "0.2.0.dev0/google"
 semantic_model:
   - name: commerce
     deployments:
-${deployments.map(d => `      - { name: ${d}, target: "//${BQ}/propertyGraphs/${d}" }`).join('\n')}
+${deployments.map(d => `      - { name: ${d}, target: "${BQ}/propertyGraphs/${d}" }`).join('\n')}
     entities:
       - name: customer
-        source: //${BQ}/tables/customer
+        source: ${BQ}/tables/customer
         primary_key: [c_id]
         fields:
           - { name: c_id, expression: c_id }
           - { name: ltv }
-${rest}`;
+`;
 
-  // Push prints the pruning note once the checks before the deploy loop
-  // pass, after their warnings. A push that then fails a source check still
-  // prints it.
-  const NOTE = "Note: profile 'default' leaves 1 field(s) unbound.";
-  const validateNoKc = {validateOnly: true, kc: false};
-  const pruned: Array<[
-    outcome: string, deployments: string[], rest: string, options: PushOptions,
-    errors: string[], warnings: string[], sources?: string[]]> = [
-    ['stopped by two deployments', ['a', 'b'], '', {validateOnly: true},
-     ["Error: model 'commerce' (commerce) declares 2 deployments; push uses " +
-      'exactly one deployment for now, with a BigQuery Graph or Spanner ' +
-      "Graph target under 'deployments'."], []],
-    // Under --all-profiles a legacy profile that passes comes first. The
-    // default binding then fails the rule on the fields a metric reads.
-    ['stopped by a later binding under --all-profiles', ['g'],
-     '    metrics:\n' +
-         '      - { name: total_ltv, expression: "SUM(customer.ltv)" }\n',
-     {...validateNoKc, allProfiles: true},
-     ["Error: model 'commerce' (commerce) deployment 'g' uses the model " +
-      "file's own bindings, under which metric 'total_ltv' reads field " +
-      "'customer.ltv', which has no expression; a deployment needs every " +
-      'field its metrics read bound.'], []],
-    ['that passes', ['a'], '', validateNoKc, [], [NOTE]],
-    ['that warns', ['g'], '          - { name: odd, expression: "odd +* (" }\n',
-     validateNoKc, [],
-     ["Warning: field 'customer.odd' in model 'commerce' (commerce): kcmd " +
-      'could not read its SQL, so the fields it reads were not checked.', NOTE]],
-    ['that fails a source check', ['g'], '', validateNoKc,
-     ['Error: the table is gone'], [NOTE], ['the table is gone']],
-  ];
-  for (const [outcome, deployments, rest, options, errors, warnings, sources = []]
-       of pruned) {
-    const note = warnings.includes(NOTE) ? 'its' : 'no';
-    test(`a pruned push ${outcome} gives ${note} pruning note`, async () => {
-      const eg = writeModel(ltvUnbound(deployments, rest));
-      if (options.allProfiles) {
-        fs.mkdirSync(path.join(eg, 'commerce.profiles'));
-        fs.writeFileSync(
-            path.join(eg, 'commerce.profiles', 'staging.yaml'),
-            `semantic_model:
+  test('a pruned push that fails a source check gives its pruning note', async () => {
+    writeModel(ltvUnbound(['g']));
+    spyOn(validateMod, 'validateBigQueryDataSources')
+        .mockResolvedValue(['the table is gone']);
+    const bqSpy = spyOn(bqLeg, 'deployBigQuery').mockResolvedValue(
+        {success: true, deployed: 0, ddl: [], warnings: []} as any);
+    expect(await push({validateOnly: true})).toBe(1);
+    expect(prints(console.error)).toEqual(['Error: the table is gone']);
+    expect(prints(console.warn))
+        .toEqual(["Note: profile 'default' leaves 1 field(s) unbound."]);
+    expect(bqSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // With KC_V2_ASPECTS on, today's path checks every aspect's size before any
+  // graph deploys. A legacy wrapper's deployment_target keeps a graph push
+  // there.
+  test("a graph push on today's path with KC_V2_ASPECTS on stops at an " +
+           'aspect too large before the graph deploys',
+       async () => {
+         process.env.KC_V2_ASPECTS = '1';
+         const model = ltvUnbound(['g']).replace(/ {4}deployments:\n.*\n/, '');
+         const eg = writeModel(model);
+         fs.mkdirSync(path.join(eg, 'commerce.profiles'));
+         fs.writeFileSync(
+             path.join(eg, 'commerce.profiles', 'staging.yaml'),
+             `semantic_model:
   - name: commerce
-    deployment_target: //${BQ}/propertyGraphs/staging
-    entities: [{ name: customer, source: "//${BQ}/tables/customer_staging" }]
+    deployment_target: ${BQ}/propertyGraphs/staging
+    entities: [{ name: customer, source: "${BQ}/tables/customer_staging" }]
 `);
-      }
-      spyOn(validateMod, 'validateBigQueryDataSources')
-          .mockResolvedValue(sources);
-      const bqSpy = spyOn(bqLeg, 'deployBigQuery').mockResolvedValue(
-          {success: true, deployed: 0, ddl: [], warnings: []} as any);
-      expect(await push(options)).toBe(errors.length ? 1 : 0);
-      expect(prints(console.error)).toEqual(errors);
-      expect(prints(console.warn)).toEqual(warnings);
-      expect(bqSpy).toHaveBeenCalledTimes(errors.length ? 0 : 1);
-    });
-  }
+         spyOn(validateMod, 'validateBigQueryDataSources')
+             .mockResolvedValue([]);
+         const bqSpy = spyOn(bqLeg, 'deployBigQuery').mockResolvedValue(
+             {success: true, deployed: 0, ddl: [], warnings: []} as any);
+         const options = {validateOnly: true, profile: 'staging'};
+         expect(await push(options)).toBe(0);
+         writeModel(`${model}    ai_context:\n      instructions: ${
+             'x'.repeat(kc.MAX_ASPECT_DATA_BYTES)}\n`);
+         expect(await push(options)).toBe(1);
+         expect(prints(console.error)).toEqual([expect.stringContaining(
+             "Error: aspect 'dataplex-types.global.guidelines' of entry " +
+             "'commerce' is too large")]);
+         expect(prints(console.warn))
+             .toEqual(["Note: profile 'staging' leaves 1 field(s) unbound."]);
+         expect(bqSpy).toHaveBeenCalledTimes(1);
+       });
 
   // Unlike a field with no expression, a field with a blank one stops the push
   // when its model file loads.
@@ -2502,10 +2510,10 @@ ${rest}`;
 semantic_model:
   - name: commerce
     deployments:
-      - { name: g, target: "//${BQ}/propertyGraphs/g" }
+      - { name: g, target: "${BQ}/propertyGraphs/g" }
     entities:
       - name: customer
-        source: //${BQ}/tables/customer
+        source: ${BQ}/tables/customer
         primary_key: [c_id]
         fields:
           - { name: c_id, expression: c_id }
@@ -2526,10 +2534,10 @@ semantic_model:
 semantic_model:
   - name: commerce
     deployments:
-      - { name: g, target: "//${BQ}/propertyGraphs/g" }
+      - { name: g, target: "${BQ}/propertyGraphs/g" }
     entities:
       - name: customer
-        source: //${BQ}/tables/customer
+        source: ${BQ}/tables/customer
         primary_key: [c_id]
         fields:
           - { name: c_id, expression: c_id }
@@ -2550,10 +2558,10 @@ semantic_model:
 semantic_model:
   - name: commerce
     deployments:
-      - { name: g, target: "//${BQ}/propertyGraphs/g" }
+      - { name: g, target: "${BQ}/propertyGraphs/g" }
     entities:
       - name: customer
-        source: //${BQ}/tables/customer
+        source: ${BQ}/tables/customer
         primary_key: [c_id]
         fields:
           - { name: c_id, expression: c_id }
@@ -2574,9 +2582,11 @@ semantic_model:
     writeModel(`version: "0.2.0.dev0/google"
 semantic_model:
   - name: commerce
+    deployments:
+      - { name: g, target: "${BQ}/propertyGraphs/g" }
     entities:
       - name: purchase
-        source: //${BQ}/tables/purchase
+        source: ${BQ}/tables/purchase
         primary_key: [p_id]
         fields:
           - { name: p_id, expression: p_id }
@@ -2587,40 +2597,57 @@ semantic_model:
           dialects:
             - { dialect: SNOWFLAKE, expression: "SUM(IFF(purchase.amount > 0, purchase.amount, 0))" }
 `);
-    const kcSpy = mockKc();
+    const kcSpy = spyOn(kc, 'preflightKnowledgeCatalog');
+    spyOn(validateMod, 'validateBigQueryDataSources').mockResolvedValue([]);
+    spyOn(validateMod, 'validateBigQueryActionStatements').mockResolvedValue([]);
+    spyOn(bqLeg, 'deployBigQuery').mockResolvedValue(
+        {success: true, deployed: 0, ddl: [], warnings: []} as any);
     const metric = () =>
         kcSpy.mock.calls.at(-1)![0][0].model.metrics![0];
-    expect(await push({validateOnly: true})).toBe(0);
+    expect(await push({validateOnly: true})).toBe(1);
     expect(prints(console.warn).join('\n')).toContain('needs transpilation');
-    expect(metric().expression).toBeUndefined();
+    expect(prints(console.error).join('\n'))
+        .toContain("targets a BigQuery graph with only a 'SNOWFLAKE' expression");
+    expect(kcSpy).not.toHaveBeenCalled();
 
     (console.warn as any).mockClear();
+    (console.error as any).mockClear();
     expect(await push({validateOnly: true, transpile: true})).toBe(0);
     expect(prints(console.warn).join('\n')).not.toContain('needs transpilation');
     expect(prints(console.warn)).toContain(
         "Warning: [commerce] metric 'positive_spend': transpiled " +
         "'SNOWFLAKE' -> 'BIGQUERY'");
-    expect(metric().expression).toBeDefined();
+    expect(metric().expression).toBeUndefined();
+    expect(metric().dialects).toEqual([
+      {
+        dialect: 'SNOWFLAKE',
+        expression: 'SUM(IFF(purchase.amount > 0, purchase.amount, 0))',
+      },
+      {
+        dialect: 'BIGQUERY',
+        expression: 'SUM(IF(purchase.amount > 0, purchase.amount, 0))',
+      },
+    ]);
+    expect(metric().stringForm).toBe(false);
   });
 
-  // Two deployments stop the push after pruning, before any live check.
   test('a pruned push warns about a metric whose SQL it cannot read', async () => {
     writeModel(`version: "0.2.0.dev0/google"
 semantic_model:
   - name: commerce
     deployments:
-      - { name: a, target: "//${BQ}/propertyGraphs/a" }
-      - { name: b, target: "//${BQ}/propertyGraphs/b" }
+      - { name: a, target: "${BQ}/propertyGraphs/a" }
+      - { name: b, target: "${BQ}/propertyGraphs/b" }
     entities:
       - name: customer
-        source: //${BQ}/tables/customer
+        source: ${BQ}/tables/customer
         primary_key: [c_id]
         fields:
           - { name: c_id, expression: c_id }
     metrics:
       - { name: broken, expression: "SUM((customer.c_id" }
 `);
-    expect(await push({validateOnly: true})).toBe(1);
+    expect(await push({validateOnly: true})).toBe(0);
     expect(prints(console.warn))
         .toContain(
             "Warning: metric 'broken' in model 'commerce' (commerce): kcmd " +
@@ -2632,10 +2659,10 @@ semantic_model:
 semantic_model:
   - name: commerce
     deployments:
-      - { name: g, target: "//${BQ}/propertyGraphs/g" }
+      - { name: g, target: "${BQ}/propertyGraphs/g" }
     entities:
       - name: customer
-        source: //${BQ}/tables/customer
+        source: ${BQ}/tables/customer
         primary_key: [c_id]
         fields:
           - { name: c_id, expression: c_id }
@@ -2665,7 +2692,7 @@ semantic_model:
   - name: commerce
     entities:
       - name: Customer
-        source: //${BQ}/tables/customer
+        source: ${BQ}/tables/customer
 `);
     mockKc();
     expect(await push({validateOnly: true})).toBe(1);
@@ -2703,7 +2730,8 @@ semantic_model:
       fs.writeFileSync(profilePath, `name: prod
 entities:
   - name: Customer
-    source: //${BQ}/tables/customer
+    source: ${BQ}/tables/customer
+    primary_key: [c_id]
     fields:
       - { name: key, expression: c_id }
 `);
@@ -2720,9 +2748,14 @@ entities:
 });
 
 describe('a vanilla model\'s profiles in its GOOGLE block', () => {
-  const BQ = '//bigquery.googleapis.com/projects/test-project/datasets';
-  const prod = (source: string) => JSON.stringify(
-      {profiles: [{name: 'prod', entities: [{name: 'Customer', source}]}]});
+  const BQ = 'bigquery.googleapis.com/projects/test-project/datasets';
+  // A profile that binds Customer to `source`, with its own key and column.
+  const binding = (name: string, source: string) => ({name, entities: [{
+    name: 'Customer', source, primary_key: ['cust_key'],
+    fields: [{name: 'key', expression: 'cust_key'}],
+  }]});
+  const prod = (source: string) =>
+      JSON.stringify({profiles: [binding('prod', source)]});
   function writeModel(block: string, catalogExtra = ''): void {
     fs.writeFileSync(
         path.join(dir, 'catalog.yaml'),
@@ -2757,10 +2790,7 @@ semantic_model:
   // Reading a block profile checks each field binding for SQL, which needs the
   // SQL parser. Each command loads the parser before it reads a block profile.
   test('each command loads the SQL parser before it reads a block profile', async () => {
-    writeModel(JSON.stringify({profiles: [{name: 'prod', entities: [
-      {name: 'Customer', source: `${BQ}/prod/tables/customer`,
-       fields: [{name: 'key', expression: 'c_key'}]},
-    ]}]}));
+    writeModel(prod(`${BQ}/prod/tables/customer`));
     // As in a new process, the parser reads nothing until a command loads it.
     let loaded = false;
     const load = sqlParser.loadSqlEngine;
@@ -2800,7 +2830,7 @@ semantic_model:
         "  profile 'prod'\n" +
         '    target: (none; no deployment names this profile)\n' +
         '    sources:\n' +
-        '      Customer -> test-project.prod.customer');
+        '      Customer -> bigquery.googleapis.com/projects/test-project/datasets/prod/tables/customer');
 
     // A source push rejects is reported under the profile, as for a file.
     writeModel(prod('not a source'));
@@ -2865,8 +2895,9 @@ semantic_model:
         'must be a JSON object.');
   });
 
-  // Push reads the GOOGLE block before the load under every profile. Beside a
-  // third-party block that fails the load, the runtime names the same problem.
+  // A plain push of a model that lists no deployments reads the GOOGLE block
+  // before the load. Beside a third-party block that fails the load, the
+  // runtime names the same problem.
   test('a GOOGLE block that does not load stops the runtime with the error push gives', async () => {
     writeModel('{');
     const file = path.join(dir, 'catalog', 'EntryGroups', 'commerce_eg', 'commerce.yaml');
@@ -2886,9 +2917,9 @@ semantic_model:
     expect(messages(errorSpy)).toBe(`Error: Model document 'commerce': ${error}`);
   });
 
-  // The runtime reads every model's profiles before it applies one, as push
-  // does, so a later model's GOOGLE block is reported under a named profile
-  // too, whichever model comes first.
+  // The runtime reads every model's profiles before it applies one, as
+  // `kcmd push --profile <name>` does, so a later model's GOOGLE block is
+  // reported under a named profile too, whichever model comes first.
   test("the runtime reads every model's GOOGLE block before it applies a profile", async () => {
     for (const bad of ['alpha', 'beta']) {
       writeModel('{}');
@@ -2992,9 +3023,10 @@ semantic_model:
       expect(messages(errorSpy)).not.toContain(alone);
     });
 
-    // The layout reads the model file's version as the block lookup reads the
-    // file, so it still refuses a sibling profile file, and the profile is not
-    // listed twice.
+    // Past a key set twice or an alias whose anchor is not set, the layout reads
+    // the model file's version as the block lookup reads the file, so it still
+    // refuses a sibling profile file, and the profile is not listed twice.
+    if (!listed) continue;
     test(`a sibling profile file beside a model file that ${what} is refused`, async () => {
       writeBroken();
       fs.writeFileSync(
@@ -3004,7 +3036,14 @@ semantic_model:
           "'commerce.yaml', which is a 0.2.0.dev0 document";
 
       await expect(push({validateOnly: true, profile: 'prod'})).rejects.toThrow(beside);
-      await expect(profiles()).rejects.toThrow(beside);
+      // A plain push loads the model file first, and so does the report.
+      const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+      expect(await push({validateOnly: true})).toBe(1);
+      expect(messages(errorSpy)).toContain(problem);
+      expect(messages(errorSpy)).not.toContain(beside);
+      errorSpy.mockClear();
+      expect(await profiles()).toBe(1);
+      expect(messages(errorSpy)).toContain(problem);
     });
   }
 
@@ -3050,18 +3089,24 @@ semantic_model:
   for (const [what, write, problem] of otherKeys) {
     test(`a GOOGLE block with ${what} does not hide one`, async () => {
       write();
+      const listsDeployments = problem.startsWith("'deployments'");
       const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
       const logSpy = spyOn(console, 'log').mockImplementation(() => {});
       const alone = "(under profile 'prod', the model file must load on its " +
           'own before the profile applies)';
 
-      expect(await push({validateOnly: true, profile: 'prod'})).toBe(1);
+      // A push of a model that lists deployments takes no --profile.
+      expect(await push({validateOnly: true,
+                         ...(listsDeployments ? {} : {profile: 'prod'})}))
+          .toBe(1);
       expect(messages(errorSpy)).toContain(problem);
-      expect(messages(errorSpy)).toContain(alone);
+      if (!listsDeployments) expect(messages(errorSpy)).toContain(alone);
       errorSpy.mockClear();
       expect(await profiles({profile: 'prod'})).toBe(1);
       expect(messages(logSpy)).toContain("  profile 'prod'");
-      expect(messages(errorSpy)).toContain(alone);
+      // For a model with deployments, the report gives a plain push's error.
+      expect(messages(errorSpy)).toContain(listsDeployments ? problem : alone);
+      if (listsDeployments) expect(messages(errorSpy)).not.toContain(alone);
       errorSpy.mockClear();
       expect(await profiles({printStore: true, profile: 'prod'})).toBe(1);
       expect(messages(errorSpy)).toContain(problem);
@@ -3188,9 +3233,8 @@ semantic_model:
   });
 
   test('they are listed by name, as profile files are', async () => {
-    const bind = (name: string) =>
-        ({name, entities: [{name: 'Customer', source: PROD_SOURCE}]});
-    writeModel(JSON.stringify({profiles: [bind('prod'), bind('dev')]}));
+    writeModel(JSON.stringify(
+        {profiles: [binding('prod', PROD_SOURCE), binding('dev', PROD_SOURCE)]}));
     const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
     const logSpy = spyOn(console, 'log').mockImplementation(() => {});
     const defined = 'defined profiles: dev, prod.';
@@ -3206,18 +3250,45 @@ semantic_model:
         .toBeLessThan(report.indexOf("  profile 'prod'"));
   });
 
-  test('a graph push of one is refused as a named profile, alone or under --all-profiles', async () => {
-    writeModel(JSON.stringify({
-      deployments: [{name: 'main', target: `${BQ}/raw/propertyGraphs/g`}],
-      profiles: [{name: 'prod', entities: [{name: 'Customer', source: PROD_SOURCE}]}],
-    }));
+  // Profile prod beside a graph target, outside any deployments list.
+  test('a graph push of one is refused as a named profile, alone, under --all-profiles, in the report or as default_profile, where the refusal points at --profile default', async () => {
+    const targeted = JSON.stringify({
+      deploymentTargets: [`${BQ}/raw/propertyGraphs/g`],
+      profiles: [binding('prod', PROD_SOURCE)],
+    });
+    writeModel(targeted);
     const errorSpy = spyOn(console, 'error').mockImplementation(() => {});
+    spyOn(console, 'log').mockImplementation(() => {});
+    const bqSpy = mockBigQuery();
 
     expect(await push({validateOnly: true, profile: 'prod'})).toBe(1);
     expect(messages(errorSpy)).toContain(`[commerce] ${NO_TARGET}`);
     errorSpy.mockClear();
     expect(await push({validateOnly: true, allProfiles: true})).toBe(1);
     expect(messages(errorSpy)).toContain(`[commerce] ${NO_TARGET}`);
+    errorSpy.mockClear();
+    expect(await profiles({profile: 'prod'})).toBe(1);
+    expect(messages(errorSpy)).toContain(`[commerce] ${NO_TARGET}`);
+
+    // Without --profile, push takes default_profile.
+    writeModel(targeted, 'default_profile: prod\n');
+    errorSpy.mockClear();
+    expect(await push({validateOnly: true, kc: false})).toBe(1);
+    expect(messages(errorSpy)).toContain(
+        "Run 'kcmd push --profile default' to deploy the model file's own " +
+        "bindings, or 'kcmd push --no-profile' to publish to Knowledge " +
+        "Catalog without deploying a graph. Both need the model file's own " +
+        'bindings to be complete.');
+    expect(bqSpy).not.toHaveBeenCalled();
+
+    // The command it names deploys the model file's own bindings.
+    errorSpy.mockClear();
+    expect(await push({validateOnly: true, kc: false, profile: 'default'}))
+        .toBe(0);
+    expect(messages(errorSpy)).not.toContain('is a named profile');
+    expect(bqSpy).toHaveBeenCalledTimes(1);
+    expect(bqSpy.mock.calls[0][0][0].model.entities?.[0].dataSource)
+        .toBe('test-project.raw.customer');
   });
 
   test('default_profile naming one applies it to a push with no --profile', async () => {
@@ -3303,6 +3374,65 @@ semantic_model:
           'so there is no store to run against. In a GOOGLE custom_extensions ' +
           "block on the model, declare a deployment in 'deployments' whose " +
           'target names a database.');
+    });
+  }
+});
+
+describe('what a push says about relationships', () => {
+  const TWO_ON_ONE_PAIR = `${MODEL_YAML}      - name: Order
+        primary_key: [id]
+        fields:
+          - { name: id }
+          - { name: buyer }
+          - { name: payer }
+    relationships:
+      - { name: bought_by, from: Order, to: Customer,
+          from_columns: [buyer], to_columns: [key] }
+      - { name: paid_by, from: Order, to: Customer,
+          from_columns: [payer], to_columns: [key] }
+`;
+  const PAID_BY = /\n      - \{ name: paid_by[^}]*\}\n/;
+  // Each case gives the exit code and a line the push prints.
+  const cases: [string, boolean, string, number, string][] = [
+    ['with KC_V2_ASPECTS on, counts entry links: one for the relationships ' +
+         'on one pair, and two reference links for each relationship',
+     true, TWO_ON_ONE_PAIR, 0,
+     'Wrote 5 new and 0 updated Knowledge Catalog entries; wrote 5 entry ' +
+         'links.'],
+    ['relationships in both directions on one pair stop the push', false,
+     TWO_ON_ONE_PAIR.replace(
+         PAID_BY,
+         '\n      - { name: first_order_of, from: Customer, to: Order, ' +
+             'from_columns: [key], to_columns: [buyer] }\n'),
+     1,
+     "Error: relationship 'first_order_of' in model 'commerce' (commerce) " +
+         "runs from 'Customer' to 'Order', and relationship 'bought_by' runs " +
+         'the other way; keep the relationships between two entities in one ' +
+         'direction.'],
+    ['a relationship from an entity to itself stops the push', false,
+     TWO_ON_ONE_PAIR.replace(
+         PAID_BY,
+         '\n      - { name: referred_by, from: Customer, to: Customer, ' +
+             'from_columns: [key], to_columns: [key] }\n'),
+     1,
+     "Error: relationship 'referred_by' in model 'commerce' (commerce) " +
+         "runs from 'Customer' to itself; a relationship joins two " +
+         'different entities.'],
+    ['with KC_V2_ASPECTS off, counts linked relationships', false,
+     TWO_ON_ONE_PAIR.replace(PAID_BY, '\n'), 0,
+     'Wrote 4 new and 0 updated Knowledge Catalog entries; linked 1 ' +
+         'relationship.'],
+  ];
+  for (const [title, v2, model, code, line] of cases) {
+    test(title, async () => {
+      writeWorkspace();
+      fs.writeFileSync(path.join(entryGroupDir(), 'commerce.yaml'), model);
+      if (v2) process.env.KC_V2_ASPECTS = '1';
+      fakeCatalog();
+
+      expect(await push({profile: false})).toBe(code);
+      expect(messages(code ? console.error : console.log).split('\n'))
+          .toContain(line);
     });
   }
 });

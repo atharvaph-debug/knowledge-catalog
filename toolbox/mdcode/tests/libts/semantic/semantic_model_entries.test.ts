@@ -14,11 +14,11 @@ import {diffLines} from '../../../src/libts/semantic/text_merge';
 
 const SCOPE = {project: 'test-project', location: 'us'};
 const ORDERS_TABLE =
-    '//bigquery.googleapis.com/projects/test-project/datasets/sales/tables/orders';
+    'bigquery.googleapis.com/projects/test-project/datasets/sales/tables/orders';
 const CUSTOMERS_TABLE =
     'bigquery.googleapis.com/projects/test-project/datasets/sales/tables/customers';
 const GRAPH =
-    '//bigquery.googleapis.com/projects/test-project/datasets/sales/propertyGraphs/commerce';
+    'bigquery.googleapis.com/projects/test-project/datasets/sales/propertyGraphs/commerce';
 
 // One model with two entities, a metric, and three relationships push would
 // not all link: two between the same pair, and one from an entity to itself
@@ -371,7 +371,7 @@ function joinEntry(name: string, from: string, to: string, column: string) {
   };
 }
 
-const TABLES = '//bigquery.googleapis.com/projects/test-project/datasets/sales/tables';
+const TABLES = 'bigquery.googleapis.com/projects/test-project/datasets/sales/tables';
 const ORDERS = entityEntry(
     'orders', `${TABLES}/orders`, ['order_id', 'customer_id', 'amount'],
     'One row per order.');

@@ -12,10 +12,10 @@ import {loadModels} from '../../../../src/libts/semantic/loader';
 import {undeclaredProfileError} from '../../../../src/libts/semantic/runtime/runtime';
 import {AlloyDbDatabase, resolveStore, withPrimaryInstance} from '../../../../src/libts/semantic/runtime/store';
 
-const DB = '//spanner.googleapis.com/projects/p/instances/i/databases/d';
-const SPANNER_GRAPH = `${DB}/propertyGraphs/g`;
+const DB = 'spanner.googleapis.com/projects/p/instances/i/databases/d';
+const SPANNER_GRAPH = `${DB}/graphs/g`;
 const CLUSTER =
-    '//alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c';
+    'alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c';
 
 function model(body: string): SemanticModel {
   return loadModels(
@@ -79,7 +79,7 @@ describe('deployments and the profiles they name', () => {
        () => {
          const m = deployed(
              `      - {name: a, target: "${SPANNER_GRAPH}"}\n` +
-             `      - {name: b, target: "${DB}2/propertyGraphs/g"}\n`);
+             `      - {name: b, target: "${DB}2/graphs/g"}\n`);
          const store = resolveStore(m, 'staging', {legacyWrapper: true});
          expect('error' in store && store.error)
              .not.toContain("for profile 'staging' (a, b)");
@@ -132,7 +132,7 @@ describe('targets', () => {
   test('a target a GOOGLE block lists twice fails the store under every profile',
        () => {
          const graph =
-             '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
+             'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
          const m = vanilla(
              JSON.stringify({deploymentTargets: [SPANNER_GRAPH, graph, graph]}));
          for (const profile of ['default', 'prod']) {

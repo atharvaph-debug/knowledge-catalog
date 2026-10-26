@@ -92,7 +92,10 @@ function runScenario(scenario: any) {
       const snapshot = await kcmac.CatalogSnapshot.fromPath('/', TEST_API_CONTEXT);
       const sync = new kcmac.CatalogSync(catalog, snapshot);
 
-      // Execute - Snapshot actions
+      // Execute - Snapshot actions, recording the warnings they print.
+      const warnings: string[] = [];
+      const warn = spyOn(console, 'warn').mockImplementation(
+        (...args: any[]) => { warnings.push(args.join(' ')); });
       const actions = scenario.actions ?? [];
       for (const actionStep of actions) {
         const { action, ...params } = actionStep;
@@ -118,6 +121,12 @@ function runScenario(scenario: any) {
           default:
             throw new Error(`Unknown action: ${action}`);
         }
+      }
+      warn.mockRestore();
+
+      // Assert expectations - Warnings
+      if (scenario.assert?.warnings) {
+        expect(warnings).toEqual(scenario.assert.warnings);
       }
 
       // Assert expectations - Filesystem
@@ -162,6 +171,9 @@ function runScenario(scenario: any) {
       // Assert expectations - Catalog Service
       if (scenario.assert?.catalog?.entries) {
         expect(JSON.parse(JSON.stringify(catalog.mockEntries))).toEqual(JSON.parse(JSON.stringify(scenario.assert.catalog.entries)));
+      }
+      if (scenario.assert?.catalog?.lookupAspectTypes) {
+        expect(catalog.lookupAspectTypes).toEqual(scenario.assert.catalog.lookupAspectTypes);
       }
     });
   });
@@ -216,9 +228,18 @@ function main() {
   );
 
   spyOn(gcp.CatalogClient.prototype, 'lookupEntry').mockImplementation(
+    async function(project: string, location: string, entry: string, aspects?: string[]) {
+      if (currentCatalogMock) {
+        return await currentCatalogMock.lookupEntry(project, location, entry, aspects);
+      }
+      return { status: 404, message: 'Not found' };
+    }
+  );
+
+  spyOn(gcp.CatalogClient.prototype, 'lookupEntryAspectTypes').mockImplementation(
     async function(project: string, location: string, entry: string) {
       if (currentCatalogMock) {
-        return await currentCatalogMock.lookupEntry(project, location, entry);
+        return await currentCatalogMock.lookupEntryAspectTypes(project, location, entry);
       }
       return { status: 404, message: 'Not found' };
     }

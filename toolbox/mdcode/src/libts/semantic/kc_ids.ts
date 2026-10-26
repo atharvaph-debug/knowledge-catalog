@@ -13,6 +13,8 @@
 //   `retail_sales.entities.store_orders` (V1) or
 //   `retail_sales/entities/store_orders` (V2).
 
+import {createHash} from 'node:crypto';
+
 import {Entity, Metric, Relationship, SemanticModel} from './ir';
 
 // Where the `semantic-*` and `schema` system types live: built-in types in
@@ -124,8 +126,7 @@ export class Namer {
   /**
    * Bare entry ID for a relationship's `semantic-relationship` entry (mapping
    * Addendum 6): `<model>/relationships/<relationship>` with the second-
-   * generation layout, and the form entityId uses otherwise. Push does not
-   * write relationship entries yet; kcmd's local entry view names them.
+   * generation layout, and the form entityId uses otherwise.
    */
   relationshipId(model: SemanticModel, rel: Relationship): string {
     return this.v2Aspects ?
@@ -157,14 +158,26 @@ export function relationshipLinkId(modelName: string, relName: string): string {
 }
 
 /**
+ * ID of a link push writes: `semantic-<kind>-` and the first 32 hex characters
+ * of the SHA-256 of `parts` joined by '/'. It must stay the same across
+ * releases, so that push finds the links it wrote.
+ */
+export function semanticLinkId(
+    kind: 'link'|'relationship'|'extends', ...parts: string[]): string {
+  const digest =
+      createHash('sha256').update(parts.join('/'), 'utf8').digest('hex');
+  return `semantic-${kind}-${digest.slice(0, 32)}`;
+}
+
+/**
  * Entry-ID prefixes owned by `modelName` across both the first-generation
  * dotted layout and the second-generation slash layout.
  *
  * The dotted prefixes use `slug(modelName)` to match V1 entries, while the
- * slash prefixes use `modelName` verbatim to match V2 entity and metric
- * entries. Because V2 model names are restricted to letters, digits,
- * underscores and hyphens, all of which `slug()` keeps, `slug(modelName)` and
- * `modelName` are equal for valid V2 models.
+ * slash prefixes use `modelName` verbatim to match V2 entity, metric and
+ * relationship entries. Because V2 model names are restricted to letters,
+ * digits, underscores and hyphens, all of which `slug()` keeps,
+ * `slug(modelName)` and `modelName` are equal for valid V2 models.
  */
 export function ownedEntryIdPrefixes(modelName: string): string[] {
   const s = slug(modelName);
@@ -176,6 +189,7 @@ export function ownedEntryIdPrefixes(modelName: string): string[] {
     `${s}.files.`,
     `${modelName}/entities/`,
     `${modelName}/metrics/`,
+    `${modelName}/relationships/`,
   ];
 }
 

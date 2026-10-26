@@ -19,7 +19,7 @@ const SCOPE = {project: 'test-project', location: 'us'};
 const GROUP = 'projects/test-project/locations/us/entryGroups/eg';
 const DOC_TYPE = 'projects/dataplex-types/locations/global/entryTypes/document';
 const ORDERS_TABLE =
-    '//bigquery.googleapis.com/projects/test-project/datasets/sales/tables/orders';
+    'bigquery.googleapis.com/projects/test-project/datasets/sales/tables/orders';
 
 const MODEL = `version: "0.2.0.dev0/google"
 semantic_model:

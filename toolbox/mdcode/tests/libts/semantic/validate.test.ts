@@ -3,26 +3,26 @@
 
 import {describe, expect, test} from 'bun:test';
 
-import {Action, CustomExtension, Entity, Metric, SemanticModel} from '../../../src/libts/semantic/ir';
+import {Action, CustomExtension, Entity, Field, Metric, ProfileSpec, SemanticModel} from '../../../src/libts/semantic/ir';
 import {listed, LoadedModel, loadModels} from '../../../src/libts/semantic/loader';
 import {mergeProfileOntoDoc} from '../../../src/libts/semantic/resolve_profiles';
 import {isColumnName} from '../../../src/libts/semantic/sql_expr_utils';
-import {validateBigQueryActionStatements, validateBigQueryDataSources, validateDeployments, validateExpressionReferences, validateInlineDialects, validatePushRequirements, validateSpannerActionStatements} from '../../../src/libts/semantic/validate';
+import {inlineBindingWarnings, validateBigQueryActionStatements, validateBigQueryDataSources, validateDeployments, validateExpressionReferences, validateInlineDialects, validatePushRequirements, validateSpannerActionStatements} from '../../../src/libts/semantic/validate';
 import {BigQueryClientMock, mockSchema, SpannerClientMock} from '../mocks';
 
 // A parsed BigQuery Graph deployment target the strict matcher accepts.
 const BQ_TARGET =
-    '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
+    'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
 
 // A parsed Spanner Graph deployment target the strict matcher accepts.
 const SPANNER_TARGET =
-    '//spanner.googleapis.com/projects/p/instances/i/databases/db/propertyGraphs/g';
+    'spanner.googleapis.com/projects/p/instances/i/databases/db/graphs/g';
 
 // A parsed AlloyDB deployment target. Not a graph target: it names a database
 // to run against, which is the whole reason a push has to say something other
 // than "typo" about it.
 const ALLOYDB_TARGET =
-    '//alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/instances/i/databases/db';
+    'alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/instances/i/databases/db';
 
 function googleExt(targets: string[]): CustomExtension {
   return {
@@ -100,8 +100,7 @@ describe('validatePushRequirements', () => {
     });
     expect(validatePushRequirements([loaded(alloy)])[0]).toContain(
         "Declare a BigQuery or Spanner Graph target (under 'deployments' in " +
-        'its GOOGLE custom_extensions block; push uses exactly one ' +
-        'deployment for now)');
+        'its GOOGLE custom_extensions block), or run');
   });
 
   test(
@@ -134,12 +133,12 @@ describe('validatePushRequirements', () => {
     // A single, otherwise well-formed URI that is neither a BigQuery nor a
     // Spanner Graph target fails because it does not parse as either.
     const m = model(
-        {}, [googleExt(['//dataplex.googleapis.com/projects/p/locations/us'])]);
+        {}, [googleExt(['dataplex.googleapis.com/projects/p/locations/us'])]);
     const errs = validatePushRequirements([loaded(m)]);
     expect(errs.length).toBe(1);
     expect(errs[0]).toContain(
-        "target '//dataplex.googleapis.com/projects/p/locations/us' is not " +
-        'a valid BigQuery Graph or Spanner Graph URI');
+        "target 'dataplex.googleapis.com/projects/p/locations/us', which is " +
+        'not a BigQuery graph, a Spanner graph or an AlloyDB database');
     expect(errs[0]).not.toContain('deploymentTarget');
   });
 
@@ -154,9 +153,8 @@ describe('validatePushRequirements', () => {
     expect(errs[0]).toContain(`target '${ALLOYDB_TARGET}' is an AlloyDB database`);
     expect(errs[0]).toContain('runs against rather than deploys to');
     expect(errs[0]).toContain(
-        "Declare a BigQuery or Spanner Graph target (under 'deployments'; " +
-        "push uses exactly one deployment for now), or run 'kcmd push " +
-        "--no-profile' to publish to Knowledge Catalog only.");
+        "Declare a BigQuery or Spanner Graph target (under 'deployments'), " +
+        "or run 'kcmd push --no-profile' to publish to Knowledge Catalog only.");
     expect(errs[0]).not.toContain('deploymentTarget');
     expect(errs[0]).not.toContain('is not a valid');
 
@@ -169,9 +167,8 @@ describe('validatePushRequirements', () => {
     expect(vanillaErrs[0]).toContain(
         "Declare a BigQuery or Spanner Graph target (list 'deployments' in " +
         "a GOOGLE custom_extensions block on the model, or set version: " +
-        "'0.2.0.dev0/google' and use 'deployments:'; push uses exactly one " +
-        "deployment for now), or run 'kcmd push --no-profile' to publish to " +
-        "Knowledge Catalog only.");
+        "'0.2.0.dev0/google' and use 'deployments:'), or run 'kcmd push " +
+        "--no-profile' to publish to Knowledge Catalog only.");
     expect(vanillaErrs[0]).not.toContain("under 'deployments'");
   });
 
@@ -185,7 +182,7 @@ describe('validatePushRequirements', () => {
 
   test('more than one deployment target is rejected', () => {
     const other =
-        '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g2';
+        'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g2';
     const m = model({}, [googleExt([BQ_TARGET, other])]);
     const errs = validatePushRequirements([loaded(m)]);
     expect(errs.length).toBe(1);
@@ -196,7 +193,7 @@ describe('validatePushRequirements', () => {
 
   test('more than one target in a vanilla model ends with the version hint', () => {
     const other =
-        '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g2';
+        'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g2';
     const m = model({version: '0.2.0.dev0'}, [googleExt([BQ_TARGET, other])]);
     const errs = validatePushRequirements([loaded(m)]);
     expect(errs).toHaveLength(1);
@@ -209,19 +206,20 @@ describe('validatePushRequirements', () => {
   // The entry to fix is named, rather than the count of targets.
   test('a target in no accepted form beside a valid one is named', () => {
     const typo = model({}, [googleExt([BQ_TARGET, 'bq-typo'])]);
-    expect(validatePushRequirements([loaded(typo)])).toEqual([
-      "model 'm' (doc) target 'bq-typo' is not a valid BigQuery Graph or " +
-          'Spanner Graph URI; expected //bigquery.googleapis.com/projects/' +
-          '<p>/datasets/<d>/propertyGraphs/<g> or //spanner.googleapis.com/' +
-          'projects/<p>/instances/<i>/databases/<db>/propertyGraphs/<g>.',
-    ]);
+    const errors = validatePushRequirements([loaded(typo)]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toStartWith(
+        "model 'm' (doc) target 'bq-typo', which is not a BigQuery graph, a " +
+        'Spanner graph or an AlloyDB database.');
     const nonString = model({version: '0.2.0.dev0'}, [{
       vendorName: 'GOOGLE',
       data: JSON.stringify({deploymentTargets: [BQ_TARGET, 42]}),
     }]);
     const errs = validatePushRequirements([loaded(nonString)]);
     expect(errs).toHaveLength(1);
-    expect(errs[0]).toContain("target '42' is not a valid BigQuery Graph");
+    expect(errs[0]).toContain(
+        "target '42', which is not a BigQuery graph, a Spanner graph or an " +
+        'AlloyDB database');
   });
 
   // A padded target is the same target, so a blank one is dropped and a padded
@@ -239,19 +237,34 @@ describe('validatePushRequirements', () => {
     expect(validatePushRequirements([loaded(blank)])).toEqual([]);
   });
 
-  // A resource name and its URI name the same graph, so listing both is a
-  // repeat, and a single resource name is a valid target.
-  test('a resource name and its URI are the same target', () => {
-    const both = model({version: '0.2.0.dev0'},
-                       [googleExt([BQ_TARGET, BQ_TARGET.slice(2)])]);
-    expect(validatePushRequirements([loaded(both)], {targetOptional: true}))
-        .toEqual([
-          `model 'm' (doc) declares duplicate deployment target '${
-              BQ_TARGET.slice(2)}'; each deployment must target a distinct ` +
-              `resource.`,
-        ]);
-    const name = model({}, [googleExt([BQ_TARGET.slice(2)])]);
-    expect(validatePushRequirements([loaded(name)])).toEqual([]);
+  // A target in no accepted form is rejected on every push, a KC-only one too,
+  // and the error names what to write instead.
+  test('a target in no accepted form is rejected on every push', () => {
+    const legacy = 'alloydb.googleapis.com/projects/p/locations/l/clusters/c/instances/i/databases/db';
+    for (const [target, rest] of [
+      [`//${BQ_TARGET}`,
+       `which is a resource URI; write its GCP resource name, without the ` +
+           `leading '//': '${BQ_TARGET}'.`],
+      [`//${legacy}`,
+       `the instance-based AlloyDB name, which names no real resource. An ` +
+           `AlloyDB database belongs to its cluster; write ` +
+           `'alloydb.googleapis.com/projects/p/locations/l/clusters/c/databases/db'.`],
+      [SPANNER_TARGET.replace('/graphs/', '/propertyGraphs/'),
+       `which names a Spanner graph by 'propertyGraphs'; write its Dataplex ` +
+           `name: '${SPANNER_TARGET}'.`],
+      ['bigquery:graph:p.d.g',
+       `which is a Knowledge Catalog name. Write the GCP resource name ` +
+           `instead: 'bigquery.googleapis.com/projects/<p>/datasets/<d>/propertyGraphs/<g>'.`],
+      ['example.com/not/a/graph',
+       `which is not a BigQuery graph, a Spanner graph or an AlloyDB database.`],
+    ]) {
+      const m = model({}, [googleExt([target])]);
+      for (const targetOptional of [false, true]) {
+        const errs = validatePushRequirements([loaded(m)], {targetOptional});
+        expect(errs).toHaveLength(1);
+        expect(errs[0]).toStartWith(`model 'm' (doc) target '${target}', ${rest}`);
+      }
+    }
   });
 
   test('malformed GOOGLE extension JSON is reported, not thrown', () => {
@@ -283,8 +296,8 @@ describe('validatePushRequirements', () => {
 
   test('targetOptional ignores the deployment target count and kind (KC-only), but still rejects duplicate targets', () => {
     // A KC-only push deploys no graph, so its deployment target is irrelevant:
-    // more than one distinct target -- and even a single malformed one -- is
-    // accepted, where a graph push rejects both. (Zero targets is covered
+    // more than one distinct target is accepted, where a graph push rejects
+    // it. (Zero targets is covered
     // above.) A repeated target URI is still rejected so a vanilla file obeys
     // the same uniqueness rule as `deployments:`.
     const dup = model({}, [googleExt([BQ_TARGET, BQ_TARGET])]);
@@ -293,16 +306,11 @@ describe('validatePushRequirements', () => {
       expect(errs.some(e => e.includes(`duplicate deployment target '${BQ_TARGET}'`))).toBe(true);
     }
     const other =
-        '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g2';
+        'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g2';
     const many = model({}, [googleExt([BQ_TARGET, other])]);
     expect(validatePushRequirements([loaded(many)], {targetOptional: true}))
         .toEqual([]);
     expect(validatePushRequirements([loaded(many)]).length).toBe(1);
-
-    const malformed = model({}, [googleExt(['//example.com/not/a/graph'])]);
-    expect(validatePushRequirements([loaded(malformed)], {targetOptional: true}))
-        .toEqual([]);
-    expect(validatePushRequirements([loaded(malformed)]).length).toBe(1);
   });
 });
 
@@ -407,6 +415,35 @@ describe('validateBigQueryDataSources', () => {
         expect(errs).toEqual([]);
         expect(calls).toBe(1);
       });
+
+  test('in the graph dataset\'s location, gives the probe\'s own error unless the retry finds another location', async () => {
+    // Probes table p.x.t with a BigQuery that answers `located` to a probe
+    // that names a location and `anywhere` to one that names none, and gives
+    // each probe's location, or null for none.
+    async function probe(located: unknown, anywhere: unknown) {
+      const bq = new BigQueryClientMock();
+      const locations: unknown[] = [];
+      bq.query = (async (_p: string, _sql: string, location?: string) => {
+                   locations.push(location ?? null);
+                   return location ? located : anywhere;
+                 }) as any;
+      const errors = await validateBigQueryDataSources(
+          [loaded(model({entities: [entity('o', 'p.x.t')]}))], bq, 'p',
+          {at: "[doc] deployment 'g'", dataset: 'p.d',
+           location: 'us-central1'});
+      return {errors, locations};
+    }
+    const missing = {status: 404, message: 'Not found: Table'};
+    expect(await probe(missing, missing)).toEqual({
+      errors: [expect.stringContaining(
+          "BigQuery table 'p.x.t', which does not exist")],
+      locations: ['us-central1', null],
+    });
+    const there = await probe({status: 503, message: 'Backend error'},
+        {status: 200, result: {jobReference: {location: 'us-central1'}}});
+    expect(there.errors).toEqual([expect.stringContaining(
+        'which could not be verified (Backend error)')]);
+  });
 });
 
 describe('action parameters', () => {
@@ -921,7 +958,7 @@ semantic_model:
   - name: sales
     entities:
       - name: customer
-        source: p.d.customer
+        source: bigquery.googleapis.com/projects/p/datasets/d/tables/customer
         fields:
           - { name: id, expression: c_custkey }
           - { name: name, expression: c_name }
@@ -974,7 +1011,7 @@ semantic_model:
                .join('\n')).toContain('cannot declare a primary key or unique keys');
     expect(check({entities: [ent('party', {...base, fields: [{name: 'id', expression: 'id'}]})]})
                .join('\n')).toContain("its field 'id' cannot carry an expression");
-    expect(check({entities: [ent('party', {...base, authoredSource: 'bigquery:p.d.party'})]})
+    expect(check({entities: [ent('party', {...base, authoredSource: 'bigquery.googleapis.com/projects/p/datasets/d/tables/party'})]})
                .join('\n')).toContain('cannot declare a source');
   });
 
@@ -1023,16 +1060,22 @@ semantic_model:
       expect(check({entities: [party, order], metrics: [metric({entity: 'party'})]})
                  .join('\n')).toContain("belongs to 'party', which is abstract");
     });
-    test('a relationship from an extended entity to itself is reported once', () => {
-      const errors = check({
+    // It is rejected as a relationship to itself, and once as a non-leaf.
+    test('a relationship from an extended entity to itself is reported once as a non-leaf', () => {
+      expect(check({
         entities: [person, employee],
         relationships: [{
           name: 'knows',
           source: {entity: 'person', columns: ['c']},
           destination: {entity: 'person', columns: ['person_id']},
         }],
-      });
-      expect(errors.filter(e => e.includes("relationship 'knows'")).length).toBe(1);
+      })).toEqual([
+        "relationship 'knows' in model 'm' (doc) connects 'person', which is " +
+            'extended by another entity; a relationship may connect only ' +
+            'concrete leaf entities.',
+        "relationship 'knows' in model 'm' (doc) runs from 'person' to " +
+            'itself; a relationship joins two different entities.',
+      ]);
     });
     test('the rules also run on a pruned model, as a graph push validates', () => {
       const errors = validatePushRequirements(
@@ -1408,7 +1451,7 @@ semantic_model:
   - name: sales
     datasets:
       - name: orders
-        source: bigquery:p.d.orders
+        source: bigquery.googleapis.com/projects/p/datasets/d/tables/orders
         primary_key: ["LOWER(o_id)"]
         fields:
           - { name: o_id, expression: o_id }
@@ -1503,7 +1546,7 @@ semantic_model:
     ]);
   });
 
-  test('rejects an undeclared from or to entity on a relationship', () => {
+  test('rejects an undeclared from or to entity on a relationship, and relationships both ways between two entities', () => {
     const badFrom = validatePushRequirements(
         [loaded(model({
           entities: [baseCustomers()],
@@ -1531,6 +1574,29 @@ semantic_model:
     expect(badTo.length).toBe(1);
     expect(badTo[0]).toContain("relationship 'placed_by'");
     expect(badTo[0]).toContain("'to' dataset 'ghost' is not defined in the model.");
+
+    const bothWays = validatePushRequirements(
+        [loaded(model({
+          entities: [baseOrders(), baseCustomers()],
+          relationships: [
+            {
+              name: 'placed_by',
+              source: {entity: 'orders', columns: ['c_id']},
+              destination: {entity: 'customers', columns: ['c_id']},
+            },
+            {
+              name: 'placed',
+              source: {entity: 'customers', columns: ['o_id']},
+              destination: {entity: 'orders', columns: ['o_id']},
+            },
+          ],
+        }))],
+        {targetOptional: true});
+    expect(bothWays).toEqual([
+      "relationship 'placed' in model 'm' (doc) runs from 'customers' to " +
+          "'orders', and relationship 'placed_by' runs the other way; keep " +
+          'the relationships between two entities in one direction.',
+    ]);
   });
 
   test('rejects mismatched from_columns and to_columns lengths on KC-only and graph pushes, calls one bound side a half-bound join, and accepts both empty on KC-only push', () => {
@@ -1893,7 +1959,7 @@ semantic_model:
         data: '${JSON.stringify({deploymentTargets: [BQ_TARGET]})}'
     datasets:
       - name: orders
-        source: bigquery:p.d.orders
+        source: bigquery.googleapis.com/projects/p/datasets/d/tables/orders
         primary_key: [id]
         fields:
           - name: id
@@ -1933,7 +1999,7 @@ semantic_model:
         data: '${JSON.stringify({deployments: [{name: 'g', target: BQ_TARGET}]})}'
     datasets:
       - name: orders
-        source: bigquery:p.d.orders
+        source: bigquery.googleapis.com/projects/p/datasets/d/tables/orders
         primary_key: [id]
         fields:
           - name: id
@@ -2076,7 +2142,7 @@ ${sourceLine}        primary_key: [id]
       - { name: months, expression: "COUNT(DISTINCT DATE_TRUNC(orders.order_date, MONTH))" }
 ${extraMetric}`;
       const bqLoaded = loadModels(yamlFor(
-          '        source: bigquery:p.d.orders\n',
+          '        source: bigquery.googleapis.com/projects/p/datasets/d/tables/orders\n',
           '      - { name: done_rev, expression: \'SUM(IF(orders.status = "done", orders.net_amount, 0))\' }\n' +
           '      - { name: recent_cnt, expression: \'COUNTIF(orders.order_date >= DATE "2024-01-01")\' }\n'));
       const bqWarnings: string[] = [];
@@ -2089,7 +2155,7 @@ ${extraMetric}`;
       // Reading `ANSI_SQL` in the BigQuery source dialect catches a bad field inside BigQuery-only syntax
       // (`DATE "2024-01-01"` does not parse in generic ANSI_SQL).
       const bqBadLoaded = loadModels(yamlFor(
-          '        source: bigquery:p.d.orders\n',
+          '        source: bigquery.googleapis.com/projects/p/datasets/d/tables/orders\n',
           '      - { name: bad_recent, expression: \'COUNTIF(orders.missing_date >= DATE "2024-01-01")\' }\n'));
       expect(validatePushRequirements(
                  bqBadLoaded.models.map(m => loaded(m, 'sales.yaml')),
@@ -2649,17 +2715,19 @@ ${extraMetric}`;
 
 // Push checks names again, for a model built in memory and a profile that
 // reaches `model.profiles` without the loader, and is the only place the
-// description limit applies.
+// description limit, link IDs and metric-field collisions are checked.
 describe('push checks names and description lengths', () => {
+  const customer: Entity =
+      {name: 'customer', dataSource: 'p.d.c', keys: ['id'], fields: []};
   const withNames = (over: Partial<SemanticModel> = {}) => model({
     entities: [{
       name: 'orders', dataSource: 'p.d.o', keys: ['id'],
       fields: [{name: 'id', expression: 'id'}],
-    }],
+    }, customer],
     ...over,
   });
-  const errorsOf = (m: SemanticModel) =>
-      validatePushRequirements([loaded(m)], {targetOptional: true});
+  const errorsOf = (m: SemanticModel, v2Aspects?: boolean) =>
+      validatePushRequirements([loaded(m)], {targetOptional: true, v2Aspects});
 
   test('a valid model passes', () => {
     expect(errorsOf(withNames())).toEqual([]);
@@ -2671,11 +2739,11 @@ describe('push checks names and description lengths', () => {
       entities: [{
         name: 'my-entity', dataSource: 'p.d.o', keys: ['id'],
         fields: [{name: 'order date', expression: 'id'}],
-      }],
+      }, customer],
       metrics: [{name: '2024_orders', expression: 'COUNT(*)'} as Metric],
       relationships: [{
         name: 'placed-by', source: {entity: 'my-entity', columns: []},
-        destination: {entity: 'my-entity', columns: []},
+        destination: {entity: 'customer', columns: []},
       }],
       deployments: [{name: 'prod,us', target: BQ_TARGET}],
       profiles: [{name: 'eu west', entities: [], relationships: []}],
@@ -2714,14 +2782,14 @@ describe('push checks names and description lengths', () => {
         name: 'orders', dataSource: 'p.d.o', keys: ['id'],
         fields: [{name: 'id', expression: 'id', description: 'f'.repeat(length)}],
         description: 'e'.repeat(length),
-      }],
+      }, customer],
       metrics: [{
         name: 'order_count', expression: 'COUNT(orders.id)', entity: 'orders',
         description: 'x'.repeat(length),
       } as Metric],
       relationships: [{
-        name: 'self_ref', source: {entity: 'orders', columns: ['id']},
-        destination: {entity: 'orders', columns: ['id']},
+        name: 'placed_by', source: {entity: 'orders', columns: ['id']},
+        destination: {entity: 'customer', columns: ['id']},
         description: 'r'.repeat(length),
       }],
     });
@@ -2729,7 +2797,7 @@ describe('push checks names and description lengths', () => {
     const errors = errorsOf(described(2001));
     for (const what of [
            "model 'm'", "entity 'orders'", "metric 'order_count'",
-           "relationship 'self_ref'",
+           "relationship 'placed_by'",
          ]) {
       expect(errors).toContain(
           `model 'm' (doc): the description of ${what} is 2001 characters ` +
@@ -2738,6 +2806,71 @@ describe('push checks names and description lengths', () => {
     // A field's description is not stored as an entry's description, so it
     // has no limit.
     expect(errors).toHaveLength(4);
+  });
+
+  // Metrics and fields on one entity share a namespace, ignoring case. The
+  // check runs before pruning, so a field pruning drops still counts.
+  describe('a metric and a field on one entity', () => {
+    const party: Entity = {
+      name: 'party', abstract: true, dataSource: '', keys: [],
+      fields: [{name: 'Customer_ID', type: 'String'}],
+    };
+    const customers = (fields: Field[] = []): Entity => ({
+      name: 'customers', extends: ['party'], dataSource: 'p.d.c', keys: ['id'],
+      fields: [{name: 'id', expression: 'id'}, ...fields],
+    });
+    const COLLIDES = (metric: string, field: string) =>
+        `Metric '${metric}' in model 'm' (doc) collides with field '${
+            field}' on entity 'customers'; metrics and fields on the same ` +
+        `entity share a namespace.`;
+    const withMetric = (name: string, fields?: Field[]) => withNames({
+      entities: [party, customers(fields)],
+      metrics: [{
+        name, expression: 'COUNT(customers.id)', entity: 'customers',
+      } as Metric],
+    });
+
+    test('collide when the field is declared or inherited', () => {
+      expect(errorsOf(withMetric('status', [{name: 'Status', expression: 's'}])))
+          .toEqual([COLLIDES('status', 'Status')]);
+      expect(errorsOf(withMetric('customer_id')))
+          .toEqual([COLLIDES('customer_id', 'Customer_ID')]);
+      expect(errorsOf(withMetric('order_count'))).toEqual([]);
+    });
+
+    test('collide before pruning drops an unbound field', () => {
+      const m = withMetric('revenue', [{name: 'revenue'}]);
+      expect(validateExpressionReferences([loaded(m)], false))
+          .toEqual([COLLIDES('revenue', 'revenue')]);
+    });
+  });
+
+  // Normalising a name to a link ID loses information: `__` reads as `-`, and
+  // everything past 63 characters is cut, which a long model name makes
+  // likely. With KC_V2_ASPECTS on, push writes no such link ID.
+  test('rejects two relationships whose names give one Knowledge Catalog link ID', () => {
+    const rel = (name: string) => ({
+      name,
+      source: {entity: 'orders', columns: ['id']},
+      destination: {entity: 'customer', columns: ['id']},
+    });
+    const longModel = `m_${'a'.repeat(50)}`;
+    const cases: Array<[model: string, a: string, b: string, linkId: string,
+                        v2Aspects?: boolean]> = [
+      ['retail', 'order_customer', 'order__customer', 'retail-order-customer'],
+      [longModel, 'rel_shared_prefix_one', 'rel_shared_prefix_two',
+       `m-${'a'.repeat(50)}-rel-shared`],
+      ['retail', 'order_customer', 'order__customer', 'retail-order-customer',
+       true],
+    ];
+    for (const [name, a, b, linkId, v2Aspects] of cases) {
+      expect(errorsOf(withNames({name, relationships: [rel(a), rel(b)]}),
+                      v2Aspects))
+          .toEqual(v2Aspects ? [] : [
+            `Relationships '${a}' and '${b}' in model '${name}' (doc) collide ` +
+            `on Knowledge Catalog link ID '${linkId}'; rename one of them.`,
+          ]);
+    }
   });
 });
 
@@ -2755,8 +2888,8 @@ const TARGET = {
       'alloydb.googleapis.com/projects/p/locations/us-central1/clusters/c/databases/db',
 };
 
-// Every deployment is held to the rules of its engine on the model file's own
-// bindings, whatever profile it names.
+// Every deployment is held to the rules of its engine, under the profile it
+// names or the model file's own bindings.
 describe('validateDeployments', () => {
   type Engine = keyof typeof TARGET;
   // A deployment entry named after its engine.
@@ -2787,9 +2920,7 @@ ${customer ? `        source: ${BQ_TABLE('customer')}\n` : ''}\
       - { name: placed_by, from: purchase, to: customer${
           join ? ', from_columns: [p_customer], to_columns: [c_id]' : ''} }
 ${metric && `    metrics:\n      - ${metric}\n`}`);
-  const check = (m: SemanticModel,
-                 opts: Parameters<typeof validateDeployments>[2] = {}) =>
-      validateDeployments(m, 'commerce', opts);
+  const check = (m: SemanticModel) => validateDeployments(m, 'commerce');
   // The start of the error saying deployment `engine` uses the model file's
   // own bindings. A list of engines gives the plural form that names each.
   const OWN = (engine: Engine|Engine[]) => typeof engine === 'string' ?
@@ -2881,7 +3012,7 @@ ${shop ? `      - { name: shop, source: ${BQ_TABLE('shop')}, primary_key: [s_id]
             [READS(['alloydb', 'bigquery'], 'm', 'customer.label', false)]);
   });
 
-  test('names every concrete entity and relationship left unbound, and leaves out the relationships under joinsChecked', () => {
+  test('names every concrete entity and relationship left unbound', () => {
     const m = commerce(
         {customer: false, join: false, deployments: deployment('alloydb')});
     m.entities[1].dataSource = '';
@@ -2890,12 +3021,6 @@ ${shop ? `      - { name: shop, source: ${BQ_TABLE('shop')}, primary_key: [s_id]
         'alloydb',
         "entities 'customer' and 'purchase' without a source and " +
             "relationships 'placed_by' and 'billed_to' without join columns")]);
-    // The caller reports a relationship with no join columns itself.
-    const noJoin = (customer: boolean) => check(
-        commerce({customer, join: false, deployments: BQ}),
-        {joinsChecked: true});
-    expect(noJoin(true)).toEqual([]);
-    expect(noJoin(false)).toEqual([UNBOUND('bigquery')]);
     // An abstract entity has no table, so it needs no source.
     const exempt = commerce({deployments: BQ});
     exempt.entities.push(
@@ -2918,6 +3043,41 @@ ${abstract ? '        abstract: true\n' : '        primary_key: [c_id]\n'}\
     expect(check(hierarchy(false)))
         .toEqual([UNBOUND(['bigquery', 'spanner'])]);
     expect(check(hierarchy(true))).toEqual([]);
+  });
+
+  test('incomplete inline bindings give one warning when no deployment uses them', () => {
+    const warned = (m: SemanticModel, named = false) =>
+        inlineBindingWarnings(m, 'commerce', named);
+    const NON_EXECUTABLE = (left: string) =>
+        `model 'commerce' (commerce) is non-executable: the model file leaves ${
+            left}, and the model declares no named profile. It cannot be ` +
+        'queried until it is bound.';
+    const NO_DEFAULT = "model 'commerce' (commerce) has an unbound 'default' " +
+        "profile: the model file leaves entity 'customer' without a source " +
+        "and relationship 'placed_by' without join columns. It cannot be " +
+        "queried through 'default'.";
+    // Complete bindings give nothing, and fields without an expression do not
+    // count. Neither do incomplete bindings a deployment uses, which the
+    // deployment rules reject.
+    for (const [i, m] of [
+           commerce(), commerce({deployments: BQ}),
+           commerce({customer: false, deployments: BQ}),
+         ].entries()) {
+      expect({i, warnings: [...warned(m), ...warned(m, true)]})
+          .toEqual({i, warnings: []});
+    }
+    for (const [m, left] of [
+           [commerce({customer: false}), "entity 'customer' without a source"],
+           [
+             commerce({join: false}),
+             "relationship 'placed_by' without join columns",
+           ],
+    ] as const) {
+      expect(warned(m)).toEqual([NON_EXECUTABLE(left)]);
+    }
+    // Beside named profiles.
+    expect(warned(commerce({customer: false, join: false}), true))
+        .toEqual([NO_DEFAULT]);
   });
 
   // A BigQuery graph turns each metric into a measure: one aggregate on the
@@ -3015,6 +3175,62 @@ ${abstract ? '        abstract: true\n' : '        primary_key: [c_id]\n'}\
       expect(check(extended)).toEqual([]);
     });
   });
+
+  // A deployment that names a profile reads it from `model.profiles`: its
+  // metrics_exclude, the metrics it prunes and the keys it states.
+  describe('under a named profile', () => {
+    // The errors for metric `metric` on deployment `engine`, which names
+    // profile ops, with ops set to `ops` and purchase keyed by `keys`.
+    const underOps = (engine: Engine, metric: string,
+                      ops: Partial<ProfileSpec> = {}, keys = ['p_id']) => {
+      const m = commerce({deployments: deployment(engine, 'ops'), metric});
+      m.entities[1].keys = keys;
+      m.profiles = [{name: 'ops', entities: [], relationships: [], ...ops}];
+      return check(m);
+    };
+    const SUM =
+        '{ name: m, entity: purchase, expression: "SUM(purchase.amount)" }';
+
+    test('a Spanner deployment fails while its profile leaves a metric available', () => {
+      expect(underOps('spanner', SUM, {metricsExclude: '*'})).toEqual([]);
+      // The completeness check reports a profile that does not apply.
+      expect(underOps('spanner', SUM, {metricsExclude: ['m', 'other']}))
+          .toEqual([]);
+      expect(underOps('spanner', SUM)).toEqual([
+        "model 'commerce' (commerce) deployment 'spanner' targets Spanner, " +
+            "which has no measures, and profile 'ops' leaves metric(s) 'm' " +
+            "available; name them in its 'metrics_exclude', or set it to \"*\".",
+      ]);
+    });
+
+    test('a BigQuery deployment holds each metric its profile leaves to the measure rules, with the keys the profile states', () => {
+      const ratio = '{ name: m, entity: purchase, ' +
+          'expression: "SUM(purchase.amount) / 2" }';
+      // A metric the profile excludes, or prunes for a field it excludes, is
+      // held to none of this.
+      expect(underOps('bigquery', ratio, {metricsExclude: ['m']})).toEqual([]);
+      const noAmount =
+          {entities: [{name: 'purchase', fieldsExclude: ['amount']}]};
+      expect(underOps('bigquery', ratio, noAmount)).toEqual([]);
+      expect(underOps('bigquery', ratio)).toEqual([
+        "model 'commerce' (commerce) deployment 'bigquery' targets BigQuery, " +
+            "where metric 'm' cannot be a measure: it is not SUM, AVG, COUNT, " +
+            'MIN or MAX over one operand.',
+      ]);
+      // Purchase has no key in the model file, and profile ops states one.
+      const keyed = {entities: [{name: 'purchase', primaryKey: ['p_id']}]};
+      expect(underOps('bigquery', SUM, keyed, [])).toEqual([]);
+      expect(underOps('bigquery', SUM, {}, [])).toEqual([
+        expect.stringContaining("which has no primary key or unique key"),
+      ]);
+    });
+
+    test('a deployment whose profile is a legacy wrapper is left out', () => {
+      const m = commerce(
+          {customer: false, deployments: deployment('bigquery', 'old')});
+      expect(check(m)).toEqual([]);
+    });
+  });
 });
 
 describe('validateInlineDialects', () => {
@@ -3068,21 +3284,30 @@ ${extra}`);
        [MISSING('e', 'BIGQUERY', HINT), MISSING('other', 'SPANNER')]],
       // The message reads "an" before a dialect that starts with a vowel.
       [alloyDb, bigQueryText, '', [MISSING('e', 'ALLOYDB', '', 'an')]],
-      // With --transpile, push translates a Snowflake text into BigQuery SQL.
-      // It translates no Spanner or AlloyDB text.
+      // With --transpile, push translates a Snowflake, Spanner or AlloyDB
+      // text into BigQuery SQL. An unsupported dialect is not translated.
       [BQ_TABLE('t'), dialects('SNOWFLAKE'), '', [MISSING('e', 'BIGQUERY', HINT)]],
       [BQ_TABLE('t'), dialects('SNOWFLAKE'), '', [], true],
       [SPANNER_TABLE, dialects('SNOWFLAKE'), '', [MISSING('e', 'SPANNER')], true],
-      [BQ_TABLE('t'), dialects('SPANNER'), '', [MISSING('e', 'BIGQUERY')]],
-      [BQ_TABLE('t'), dialects('SPANNER'), '', [MISSING('e', 'BIGQUERY')], true],
-      [BQ_TABLE('t'), dialects('ALLOYDB'), '', [MISSING('e', 'BIGQUERY')]],
-      [BQ_TABLE('t'), dialects('ALLOYDB'), '', [MISSING('e', 'BIGQUERY')], true],
+      [BQ_TABLE('t'), dialects('SPANNER'), '', [MISSING('e', 'BIGQUERY', HINT)]],
+      [BQ_TABLE('t'), dialects('SPANNER'), '', [], true],
+      [BQ_TABLE('t'), dialects('ALLOYDB'), '', [MISSING('e', 'BIGQUERY', HINT)]],
+      [BQ_TABLE('t'), dialects('ALLOYDB'), '', [], true],
     ];
     for (const [source, expression, extra, errors, transpiled] of cases) {
       const actual = check(withField(source, expression, extra), transpiled);
       expect({source, expression, extra, transpiled, errors: actual})
           .toEqual({source, expression, extra, transpiled, errors});
     }
+    // An unsupported dialect on an in-memory model is not translated.
+    const unsupported = withField(BQ_TABLE('t'), dialects('SNOWFLAKE'));
+    unsupported.entities[0].fields[1] = {
+      name: 'f',
+      importedExpression: 'x',
+      importedDialect: 'TERADATA',
+    };
+    expect(check(unsupported)).toEqual([MISSING('e', 'BIGQUERY')]);
+    expect(check(unsupported, true)).toEqual([MISSING('e', 'BIGQUERY')]);
     // An unbound field and an entity with no source are skipped.
     const unbound = withField(SPANNER_TABLE, bigQueryText);
     unbound.entities[0].fields[1] = {name: 'f'};

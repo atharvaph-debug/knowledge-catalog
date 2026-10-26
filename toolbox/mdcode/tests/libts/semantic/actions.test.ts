@@ -73,7 +73,7 @@ function withActions(actions: any[], over: any = {}) {
           name: 'm',
           datasets: [{
             name: 'customer',
-            source: 'p.d.c',
+            source: 'bigquery.googleapis.com/projects/p/datasets/d/tables/c',
             primary_key: ['id'],
             fields: [
               {name: 'id', datatype: 'Integer', description: 'The account number.'},
@@ -169,7 +169,7 @@ describe('loader parses actions', () => {
                 name: 'm',
                 datasets: [{
                   name: 'customer',
-                  source: 'p.d.c',
+                  source: 'bigquery.googleapis.com/projects/p/datasets/d/tables/c',
                   primary_key: ['id'],
                   fields: [{
                     name: 'id',
@@ -339,7 +339,7 @@ describe('loader parses actions', () => {
             name: 'm',
             datasets: [{
               name: 'customer',
-              source: 'p.d.c',
+              source: 'bigquery.googleapis.com/projects/p/datasets/d/tables/c',
               primary_key: ['id'],
               fields: [
                 {name: 'id', datatype: 'Integer', expression: 'id'},
@@ -371,7 +371,7 @@ describe('loader parses actions', () => {
           semantic_model: [{
             name: 'm',
             datasets:
-                [{name: 'c', source: 'p.d.c', primary_key: ['id'], fields: []}]
+                [{name: 'c', source: 'bigquery.googleapis.com/projects/p/datasets/d/tables/c', primary_key: ['id'], fields: []}]
           }],
         },
         {allowLegacyBareSource: true});
@@ -507,7 +507,7 @@ describe('loader parses actions', () => {
 
 describe('validatePushRequirements gates actions', () => {
   const target =
-      '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
+      'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
   const googleExt = {
     vendorName: 'GOOGLE',
     data: JSON.stringify({deploymentTargets: [target]})
@@ -940,13 +940,12 @@ describe('Knowledge Catalog round trip across executor kinds', () => {
 
 describe('actions projecting concepts the push does not publish', () => {
   test(
-      'a parameter projected from an abstract entity publishes, and warns',
+      'a parameter projected from an abstract entity publishes, and warns ' +
+          'only with the first-generation types',
       () => {
-        // An abstract entity is a table-less supertype, so the Knowledge
-        // Catalog leg skips it. The parameter still publishes whole -- its type
-        // and wording were resolved at load and travel in the aspect -- but the
-        // catalog then names a concept it has no entry for, which is what the
-        // warning is about.
+        // With the first-generation types the Knowledge Catalog leg skips an
+        // abstract entity. The published parameter then names a concept with
+        // no entry, which draws the warning.
         const {models} = fromDocument(
             {
               version: '0.2.0.dev0/google',
@@ -960,7 +959,7 @@ describe('actions projecting concepts the push does not publish', () => {
                   },
                   {
                     name: 'customer',
-                    source: 'p.d.c',
+                    source: 'bigquery.googleapis.com/projects/p/datasets/d/tables/c',
                     primary_key: ['id'],
                     fields: [{
                       name: 'id',
@@ -985,6 +984,11 @@ describe('actions projecting concepts the push does not publish', () => {
                    w => w.includes('parameter \'who\'') &&
                        w.includes('does not publish')))
             .toBe(true);
+        // The second-generation types give the entity an entry, so the
+        // parameter draws no warning.
+        expect(generateCatalogResources(models[0], {...OPTS, v2Aspects: true})
+                   .warnings.filter(w => w.includes('does not publish')))
+            .toEqual([]);
       });
 });
 
@@ -1214,7 +1218,7 @@ describe('a published statement and a run read the verb the same way', () => {
   // (`validatePushRequirements`) calls `sqlExecutorErrors` to accept all of
   // these while rejecting non-DML verbs.
   const target =
-      '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
+      'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
 
   function withStatement(sql: string): LoadedModel {
     return {
@@ -1297,7 +1301,7 @@ describe('a published statement and a run read the verb the same way', () => {
 
 describe('a lone projection is not blamed for a duplication', () => {
   const target =
-      '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
+      'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
 
   test(
       'one parameter projected from a field, beside a described scalar of the same type',

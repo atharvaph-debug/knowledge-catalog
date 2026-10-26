@@ -70,7 +70,7 @@ describe('emitter -> reader round trip (lossless slice)', () => {
     description: 'the sales model',
     entities: [{
       name: 'orders',
-      authoredSource: '//bigquery.googleapis.com/projects/demo/datasets/sales/tables/orders',
+      authoredSource: 'bigquery.googleapis.com/projects/demo/datasets/sales/tables/orders',
       dataSource: 'demo.sales.orders',
       keys: [],  // no keys: an entity with none writes no primaryKey
       fields: [
@@ -428,7 +428,7 @@ describe('relationship recovery (schema-join links -> IR)', () => {
   });
 
   test(
-      'a relationship between bigquery: and BigLake entities preserves direction without warnings',
+      'a relationship between BigQuery and BigLake entities preserves direction without warnings',
       () => {
         // `sales-customer` sorts before `sales-orders` in the link's
         // entryReferences, so `readRelationships` sees [customer, orders] and
@@ -440,7 +440,7 @@ describe('relationship recovery (schema-join links -> IR)', () => {
           entities: [
             {
               name: 'customer',
-              authoredSource: 'bigquery:p.d.customer',
+              authoredSource: 'bigquery.googleapis.com/projects/p/datasets/d/tables/customer',
               dataSource: 'p.d.customer',
               keys: ['c_custkey'],
               fields: [{name: 'c_custkey', expression: 'customer.c_custkey'}],
@@ -448,7 +448,7 @@ describe('relationship recovery (schema-join links -> IR)', () => {
             {
               name: 'orders',
               authoredSource:
-                  '//biglake.googleapis.com/projects/p/catalogs/c/namespaces/n/tables/orders',
+                  'biglake.googleapis.com/projects/p/catalogs/c/namespaces/n/tables/orders',
               dataSource: 'p.c.n.orders',
               keys: ['o_orderkey'],
               fields: [{name: 'o_custkey', expression: 'orders.o_custkey'}],
@@ -477,7 +477,7 @@ describe(
     () => {
       test('the GOOGLE deployment targets ride back onto deployments and custom_extensions with a name warning', () => {
         const uri =
-            '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
+            'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
         const data = JSON.stringify({deploymentTargets: [uri]});
         const model: SemanticModel = {
           name: 'sales',
@@ -512,9 +512,9 @@ describe(
             expect(warnings).toEqual([]);
           });
 
-      test('skips repeated target URIs in the semantic-model aspect', () => {
+      test('skips repeated targets in the semantic-model aspect', () => {
         const uri =
-            '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
+            'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
         const model: SemanticModel = {
           name: 'sales',
           customExtensions: [{
@@ -536,7 +536,7 @@ describe(
           'trims stored targets and entity source resources, and drops empty targets',
           () => {
             const uri =
-                '//bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
+                'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
             const model: SemanticModel = {
               name: 'sales',
               entities: [{name: 'e', dataSource: 'p.d.t', keys: [], fields: []}],
@@ -553,7 +553,7 @@ describe(
                 entries.find(e => e.entryType.endsWith('/semantic-entity'))!;
             entityEntry.aspects!['dataplex-types.global.semantic-entity'].data =
                 {
-                  source: {resources: ['  bigquery:p.d.t  ']},
+                  source: {resources: ['  bigquery.googleapis.com/projects/p/datasets/d/tables/t  ']},
                 };
             const {models} = modelsFromCatalogResources(entries, entryLinks);
             expect(models[0].deployments).toEqual([
@@ -566,7 +566,7 @@ describe(
               },
             ]);
             expect(models[0].entities[0].authoredSource)
-                .toBe('bigquery:p.d.t');
+                .toBe('bigquery.googleapis.com/projects/p/datasets/d/tables/t');
             expect(models[0].entities[0].dataSource).toBe('p.d.t');
           });
     });
@@ -718,24 +718,55 @@ describe('data source resource-path parsing', () => {
     expect(readDataSource(query)).toBe(query);
   });
 
-  // Push stores a catalog name in `importedResource` and leaves `resources`
-  // empty, so the reader takes the source from there.
-  test('a catalog name is read back from importedResource', () => {
-    const read = (authoredSource: string, dataSource: string) => roundTrip({
-                   name: 'm',
-                   entities: [
-                     {name: 'e', authoredSource, dataSource, keys: [], fields: []}
-                   ],
-                   relationships: [],
-                   metrics: [],
-                 }).models[0].entities[0];
-    const bq = read('bigquery:proj.ds.tbl', 'proj.ds.tbl');
-    expect(bq.dataSource).toBe('proj.ds.tbl');
-    expect(bq.authoredSource).toBe('bigquery:proj.ds.tbl');
-    const cloudSql = 'cloudsql_mysql:acme.us.inst.shop.payments';
-    const cs = read(cloudSql, cloudSql);
-    expect(cs.dataSource).toBe(cloudSql);
-    expect(cs.authoredSource).toBe(cloudSql);
+  // A push before resource names were required may have stored a source as a
+  // catalog name, in `importedResource`, or as a resource URI, and a target in
+  // either form. Pull returns each as stored and warns, naming what to write.
+  test('a catalog name or resource URI an older push stored is returned as stored, with a warning', () => {
+    const bq = 'bigquery.googleapis.com/projects/proj/datasets/ds/tables/tbl';
+    const graph = 'bigquery.googleapis.com/projects/proj/datasets/ds/propertyGraphs/g';
+    // The entity's source record and the model's target as an older push
+    // wrote them.
+    const read = (source: object, target: string) => {
+      const {entries, entryLinks} = generateCatalogResources({
+        name: 'm',
+        deployments: [{name: 'default', target: graph}],
+        entities: [{name: 'e', authoredSource: bq, dataSource: 'proj.ds.tbl', keys: [], fields: []}],
+        relationships: [],
+        metrics: [],
+      }, OPTS);
+      const aspect = (type: string) => Object.entries(
+          entries.find(e => e.entryType.endsWith(`/${type}`))!.aspects!)
+          .find(([key]) => key.endsWith(`.${type}`))![1];
+      aspect('semantic-entity').data!.source = source;
+      aspect('semantic-model').data!.deploymentTargets = [target];
+      return modelsFromCatalogResources(entries, entryLinks);
+    };
+    const mysql = 'cloudsql_mysql:acme.us.inst.shop.payments';
+    for (const [source, stored, fix] of [
+      [{resources: [], importedResource: 'bigquery:proj.ds.tbl'}, 'bigquery:proj.ds.tbl',
+       `a Knowledge Catalog name; write the table's GCP resource name: '${bq}'`],
+      [{resources: [`//${bq}`]}, `//${bq}`,
+       `a resource URI; write its GCP resource name, without the leading '//': '${bq}'`],
+      [{resources: [], importedResource: mysql}, mysql,
+       `a Knowledge Catalog name; write the table's GCP resource name: ` +
+           `'cloudsql.googleapis.com/projects/acme/locations/us/instances/inst/databases/shop/tables/payments'`],
+    ] as const) {
+      const {models, warnings} = read(source, graph);
+      expect(models[0].entities[0].authoredSource).toBe(stored);
+      expect(warnings).toContain(`entity 'e': stored source '${stored}' is ${fix}.`);
+    }
+    for (const [target, fix] of [
+      [`//${graph}`,
+       `which is a resource URI; write its GCP resource name, without the leading '//': '${graph}'.`],
+      ['bigquery:graph:proj.ds.g',
+       `which is a Knowledge Catalog name. Write the GCP resource name instead: ` +
+           `'bigquery.googleapis.com/projects/<p>/datasets/<d>/propertyGraphs/<g>'.`],
+    ]) {
+      const {models, warnings} = read({resources: [bq]}, target);
+      expect(models[0].deployments).toEqual([{name: 'default', target}]);
+      expect(warnings).toContain(
+          `model 'm': stored deployment target '${target}', ${fix}`);
+    }
   });
 
   // A GCP resource name is the resource URI without the leading `//`. Push
@@ -804,29 +835,6 @@ semantic_model:
     expect(again.entities.map(e => e.authoredSource))
         .toEqual(model.entities.map(e => e.authoredSource));
     expect(again.deployments).toEqual([{name: 'default', target}]);
-  });
-
-  // A catalog written by an older kcmd or another tool can list one target in
-  // both spellings. Pull keeps one, so the file it writes loads.
-  test('a pulled target listed in both spellings writes a file that loads', () => {
-    const target = 'bigquery.googleapis.com/projects/p/datasets/d/propertyGraphs/g';
-    const [model] = loadModels(`version: "0.2.0.dev0"
-semantic_model:
-  - name: sales
-    custom_extensions:
-      - vendor_name: GOOGLE
-        data: '{"deploymentTargets": ["//${target}", "${target}"]}'
-    datasets:
-      - name: orders
-        source: "bigquery.googleapis.com/projects/p/datasets/d/tables/orders"
-        primary_key: [o_id]
-        fields:
-          - name: o_id
-            expression: { dialects: [{ dialect: ANSI_SQL, expression: o_id }] }
-`).models;
-    const {entries, entryLinks} = generateCatalogResources(model, OPTS);
-    const {models: [read]} = modelsFromCatalogResources(entries, entryLinks);
-    expect(() => loadModels(serializeModel(read).yaml)).not.toThrow();
   });
 
   test('a legacy instance-based AlloyDB source written as a name is stored as written', () => {
@@ -924,7 +932,7 @@ describe('metric attach entity is re-derived from the expression', () => {
           entities: [
             {
               name: 'orders',
-              authoredSource: 'bigquery:p.d.orders',
+              authoredSource: 'bigquery.googleapis.com/projects/p/datasets/d/tables/orders',
               dataSource: 'p.d.orders',
               keys: ['id'],
               fields: [
@@ -934,7 +942,7 @@ describe('metric attach entity is re-derived from the expression', () => {
             },
             {
               name: 'customer',
-              authoredSource: 'bigquery:p.d.customer',
+              authoredSource: 'bigquery.googleapis.com/projects/p/datasets/d/tables/customer',
               dataSource: 'p.d.customer',
               keys: ['id'],
               fields: [
@@ -968,11 +976,11 @@ describe('metric attach entity is re-derived from the expression', () => {
           '  - name: m',
           '    entities:',
           '      - name: orders',
-          '        source: bigquery:p.d.orders',
+          '        source: bigquery.googleapis.com/projects/p/datasets/d/tables/orders',
           '        primary_key: [amt]',
           '        fields: [{name: amt, expression: orders.amt}]',
           '      - name: customer',
-          '        source: bigquery:p.d.customer',
+          '        source: bigquery.googleapis.com/projects/p/datasets/d/tables/customer',
           '        primary_key: [region]',
           '        fields: [{name: region, expression: customer.region}]',
           '    metrics:',
@@ -1361,7 +1369,7 @@ describe('an expression with no SQL stored in the catalog', () => {
     name: 'sales',
     entities: [{
       name: 'orders',
-      authoredSource: '//bigquery.googleapis.com/projects/demo/datasets/sales/tables/orders',
+      authoredSource: 'bigquery.googleapis.com/projects/demo/datasets/sales/tables/orders',
       dataSource: 'demo.sales.orders',
       keys: ['id'],
       fields: [

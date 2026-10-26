@@ -19,7 +19,7 @@ import {AlloyDbClient, Instance} from '../../gcp/alloydb';
 import {ApiResult} from '../../gcp/api';
 import {AlloyDbTarget, deploymentTargetError, deploymentTargetKeyError, destinationKey, googleBlockTargetError, GoogleDeploymentTargets, googleDeploymentTargets} from '../deployment_target';
 import {SemanticModel} from '../ir';
-import {asResourceUri, databaseOf, OSSIE_VERSION} from '../loader';
+import {asResourceName, databaseOf, OSSIE_VERSION, writtenSource} from '../loader';
 import {DEFAULT_PROFILE} from '../resolve_profiles';
 
 
@@ -123,14 +123,21 @@ function storeOf(source: string): string|undefined {
 // Every table the model binds, not just its entities: a many-to-many
 // relationship is backed by a junction table of its own, and an action that
 // creates the edge writes to exactly that one.
-function boundTables(model: SemanticModel): Array<{name: string; source: string}> {
-  const bindings: Array<{name: string; source: string}> = [];
+function boundTables(model: SemanticModel):
+    Array<{name: string; source: string; shown: string}> {
+  const bindings: Array<{name: string; source: string; shown: string}> = [];
   for (const entity of model.entities ?? []) {
-    bindings.push({name: entity.name, source: entity.dataSource ?? ''});
+    bindings.push({
+      name: entity.name,
+      source: entity.dataSource ?? '',
+      shown: writtenSource(entity),
+    });
   }
   for (const relationship of model.relationships ?? []) {
     const source = relationship.association?.dataSource;
-    if (source) bindings.push({name: relationship.name, source});
+    if (source) {
+      bindings.push({name: relationship.name, source, shown: asResourceName(source)});
+    }
   }
   return bindings;
 }
@@ -164,11 +171,11 @@ function strayBindings(model: SemanticModel, store: ChosenStore): string[] {
     if (!source) continue;
     const bound = storeOf(source);
     if (!bound) {
-      strays.push(
-          `'${binding.name}' to ${source}, which is not a table in this store`);
+      strays.push(`'${binding.name}' to ${
+          binding.shown}, which is not a table in this store`);
       continue;
     }
-    if (bound !== database) strays.push(`'${binding.name}' to ${source}`);
+    if (bound !== database) strays.push(`'${binding.name}' to ${binding.shown}`);
   }
   return strays;
 }
@@ -179,17 +186,16 @@ function strayBindings(model: SemanticModel, store: ChosenStore): string[] {
  *
  * `named` is set when the model's deployments name a target and still no
  * store results, so a caller that runs against the store fails. `rejected` is
- * set with it when push rejects those deployments too, so the model is wrong
- * whatever it is used for. Push rejects a target in no accepted form in any
- * deployment, whichever profile the deployment is for, and a target listed
- * twice. It also rejects a GOOGLE block whose data is not valid JSON, and
- * several targets for the profile that leave the store ambiguous. `named`
- * alone means the model binds a table outside its Spanner or AlloyDB store.
+ * set with it when the deployments give no store whatever the model is used
+ * for: a target in no accepted form in any deployment, a target listed twice,
+ * a GOOGLE block whose data is not valid JSON, or several targets for the
+ * profile. `named` alone means the model binds a table outside its Spanner or
+ * AlloyDB store.
  *
  * Neither is set when the profile names no store, unless a target is in no
  * accepted form or listed twice, or a GOOGLE block is not valid JSON. Neither
  * is set either when a BigQuery model binds a table outside the graph's
- * dataset, which push accepts.
+ * dataset.
  */
 export interface StoreError {
   error: string;
@@ -227,7 +233,7 @@ export interface StoreError {
  * 6. There is no target, so there is nothing to run against.
  * 7. The model binds a table outside the store. For a Spanner or AlloyDB
  *    store, a write would land in the wrong place, and the error is named. A
- *    BigQuery graph may read tables in any dataset, and push accepts that, so
+ *    BigQuery graph may read tables in any dataset, so
  *    for a BigQuery store the error is not named.
  */
 export function resolveStore(
@@ -258,10 +264,9 @@ export function resolveStore(
                                      `'deployments'`;
 
   // Every push refuses a target listed twice, even beside one that gives a
-  // store. A resource name and its URI name the same target. The loader
-  // refuses a repeat in `deployments`, so a repeat here is in a GOOGLE block.
-  const keys = all.uris.map(asResourceUri);
-  const repeated = all.uris.find((uri, i) => keys.indexOf(keys[i]) < i);
+  // store. The loader refuses a repeat in `deployments`, so a repeat here is
+  // in a GOOGLE block.
+  const repeated = all.uris.find((uri, i) => all.uris.indexOf(uri) < i);
   if (repeated !== undefined) {
     return {
       error: `Model '${model.name}' declares duplicate deployment target '${
@@ -342,7 +347,7 @@ export function resolveStore(
           `target store's table of that name rather than in the bound one. ` +
           `Bind both to the same store.`,
       // A BigQuery graph may read tables in any dataset, BigLake included,
-      // and push accepts that. The model then has no store, and a caller
+      // so the model then has no store, and a caller
       // does not fail.
       ...(store.kind === 'bigquery' ? {} : {named: true}),
     };

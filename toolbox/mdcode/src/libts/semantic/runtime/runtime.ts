@@ -16,10 +16,12 @@
 
 import {AlloyDbClient} from '../../gcp/alloydb';
 import * as context from '../../gcp/context';
+import {CatalogClient} from '../../gcp/dataplex';
 import {fileNameOf, SemanticModelLayout} from '../../layouts/semantic-model';
 import {CatalogSnapshot} from '../../snapshot';
 import {Sources} from '../../source';
 import {SemanticModelSource} from '../../sources/semantic-model';
+import {cloudSqlDialects} from '../cloudsql_dialect';
 import {SemanticModel} from '../ir';
 import {loadSemanticModels, SemanticModelError} from '../loader';
 import {resolveInheritance, ResolveResult} from '../resolve_inheritance';
@@ -55,8 +57,8 @@ export interface SemanticRuntime {
    */
   storeFailed?: boolean;
   /**
-   * Set with `storeFailed` when push rejects the model's deployments too, so
-   * the model is wrong whatever it is used for. One such case is a target in
+   * Set with `storeFailed` when the model's deployments give no store
+   * whatever the model is used for. One such case is a target in
    * no accepted form in any deployment. Another is a GOOGLE block that is not
    * valid JSON. A third is several targets for the profile with no single
    * store. A table bound outside the store and a failed AlloyDB lookup are
@@ -152,13 +154,13 @@ export async function createSemanticRuntimes(options: CreateRuntimeOptions = {})
     return {error: `${err?.message ?? err}`};
   }
 
-  // Push reads every model's profiles first, whichever profile it deploys:
-  // its profile files, then the profiles a vanilla model carries in its
-  // GOOGLE block. It refuses the scope when profileDocuments rejects a file,
-  // such as a `<model>.profile.<name>.yaml` file whose `name:` does not match
-  // its file name, or when a GOOGLE block profile does not load. It also
-  // refuses it when a model declares a profile named `default` in any letter
-  // case.
+  // The runtime reads every model's profiles first, as
+  // `kcmd push --profile <name>` does: its profile files, then the profiles
+  // a vanilla model carries in its GOOGLE block. It refuses the scope when
+  // profileDocuments rejects a file, such as a `<model>.profile.<name>.yaml`
+  // file whose `name:` does not match its file name, or when a GOOGLE block
+  // profile does not load. It also refuses it when a model declares a profile
+  // named `default` in any letter case.
   const profilesByDoc = new Map<string, DeclaredProfile[]>();
   // Each model's profile files alone, which an error applying one names.
   const filesByDoc =
@@ -177,6 +179,16 @@ export async function createSemanticRuntimes(options: CreateRuntimeOptions = {})
     profilesByDoc.set(doc.name, available);
     filesByDoc.set(doc.name, files);
   }
+
+  // A Cloud SQL table written as its resource name takes its dialect from its
+  // Knowledge Catalog entry, looked up once for the scope before anything
+  // loads. A table whose entry cannot be read stops the scope, as push does.
+  const lookup = await cloudSqlDialects(
+      [...docs.map(d => d.text),
+       ...[...filesByDoc.values()].flat().map(f => f.text)],
+      new CatalogClient(ctx));
+  if (lookup.errors.length) return {error: lookup.errors.join('\n')};
+  const load = {cloudSqlDialects: lookup.dialects};
 
   const merged: Array<{
     name: string; text: string; allowLegacyBareSource?: boolean;
@@ -198,7 +210,7 @@ export async function createSemanticRuntimes(options: CreateRuntimeOptions = {})
       continue;
     }
     const available = profilesByDoc.get(doc.name) ?? [];
-    const res = profileForDocument(doc, available, profile);
+    const res = profileForDocument(doc, available, profile, load);
     if (res.kind === 'missing') {
       return {error: unknownProfileMessage(profile, doc.name, res.declared)};
     }
@@ -226,7 +238,7 @@ export async function createSemanticRuntimes(options: CreateRuntimeOptions = {})
   }
 
   const loaded = loadSemanticModels(
-      merged, {defaultProject, bindingOptional: true});
+      merged, {defaultProject, bindingOptional: true, ...load});
   if (loaded.error) return {error: loaded.error};
   // In the order of the documents, as one load of them all gives. The load
   // prefixes each warning with its document's name.
@@ -242,7 +254,7 @@ export async function createSemanticRuntimes(options: CreateRuntimeOptions = {})
   });
 
   // A deployment that names a profile the model does not declare would be
-  // used by no profile. Push refuses every deployment that names a profile.
+  // used by no profile. Push refuses it too.
   for (const {document, model} of models) {
     const declared = (profilesByDoc.get(document) ?? []).map(p => p.name);
     const error = undeclaredProfileError(document, model, declared);
@@ -303,8 +315,9 @@ export async function createSemanticRuntimes(options: CreateRuntimeOptions = {})
       deploymentTarget: wrapped.get(document),
     });
     // Resolving throws on an `extends` that names an entity the model does
-    // not declare, on a cycle, and on a field inherited from two unrelated
-    // ancestors. The loader lets each through, and push reports it as an
+    // not declare, on a cycle, on a field inherited from two unrelated
+    // ancestors, and on two fields of one entity whose names differ only in
+    // case. The loader lets each through, and push reports it as an
     // error. An AlloyDB database runs an inherited text as PostgreSQL, where
     // `#` starts no comment.
     let resolved: ResolveResult;
