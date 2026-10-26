@@ -141,9 +141,114 @@ describe('conceptToEntry', () => {
     expect(e.aspects?.[OVERVIEW_ASPECT_KEY]).toBeUndefined();
   });
 
-  test('a concept with no stashed entry type is refused', () => {
-    expect(() => conceptToEntry(concept({type: 'knowledge-base'}), GROUP)).toThrow(
-      ConceptError,
+  test('a pure OKF concept without x-kcmd defaults to document entryType and infers document.type and parent', () => {
+    const e = conceptToEntry(
+      concept(
+        {
+          type: 'Table',
+          title: 'bikeshare_trips',
+          resource: 'bigquery.googleapis.com/projects/p/datasets/d/tables/t',
+          tags: ['trips', 'austin'],
+          status: 'verified',
+        },
+        '# bikeshare_trips\n\nBody.\n',
+        'tables/bikeshare_trips',
+      ),
+      GROUP,
     );
+    expect(e.name).toBe(`${GROUP}/entries/tables/bikeshare_trips`);
+    expect(e.entryType).toBe(DOCUMENT);
+    expect(e.parentEntry).toBe(`${GROUP}/entries/tables`);
+    expect(e.aspects?.[DOC_FACET]).toEqual({data: {type: 'table-context'}});
+    expect((e.aspects?.[OVERVIEW_ASPECT_KEY] as any).data.content).toContain(
+      '## OKF Metadata',
+    );
+    expect((e.aspects?.[OVERVIEW_ASPECT_KEY] as any).data.content).toContain(
+      'status: verified',
+    );
+  });
+
+  test('maps pure OKF root index.md to agents and <dir>/index.md to <dir>', () => {
+    const rootIdx = conceptToEntry(
+      concept({okf_version: '0.2'}, '# Austin bikeshare knowledge\n', 'index'),
+      GROUP,
+    );
+    expect(rootIdx.name).toBe(`${GROUP}/entries/agents`);
+    expect(rootIdx.parentEntry).toBeUndefined();
+    expect(rootIdx.entrySource?.displayName).toBe('Austin bikeshare knowledge');
+    expect(rootIdx.aspects?.[DOC_FACET]).toEqual({
+      data: {type: 'knowledge-base'},
+    });
+
+    const dirIdx = conceptToEntry(
+      concept({}, '# Tables\n', 'tables/index'),
+      GROUP,
+    );
+    expect(dirIdx.name).toBe(`${GROUP}/entries/tables`);
+    expect(dirIdx.parentEntry).toBe(`${GROUP}/entries/agents`);
+    expect(dirIdx.entrySource?.displayName).toBe('Tables');
+    expect(dirIdx.aspects?.[DOC_FACET]).toEqual({
+      data: {type: 'knowledge-base-index'},
+    });
+  });
+
+  test('accepts extra frontmatter block as an alias for x-kcmd residue', () => {
+    const e = conceptToEntry(
+      concept(
+        {
+          type: 'Runbook',
+          title: 'ops-sop',
+          extra: {
+            type: DOCUMENT,
+            resource: {
+              parent: `${GROUP}/entries/docs`,
+              system: 'KnowledgeCatalog',
+            },
+          },
+        },
+        '# ops-sop\n',
+        'docs/ops-sop',
+      ),
+      GROUP,
+    );
+    expect(e.entryType).toBe(DOCUMENT);
+    expect(e.parentEntry).toBe(`${GROUP}/entries/docs`);
+    expect(e.entrySource?.system).toBe('KnowledgeCatalog');
+    expect(e.aspects?.[DOC_FACET]).toEqual({data: {type: 'runbook'}});
+  });
+
+  test('does not inject a spurious type property onto a query-template aspect', () => {
+    const qtType =
+      'projects/dataplex-types/locations/global/entryTypes/query-template';
+    const qtAspect = 'dataplex-types.global.query-template';
+    const e = conceptToEntry(
+      withResidue(
+        {
+          entryType: qtType,
+          aspects: {
+            [qtAspect]: {
+              query: 'SELECT 1',
+              nlQuery: 'one',
+              intent: 'test',
+              sourceType: 'BIGQUERY',
+            },
+          },
+        },
+        {type: 'query-template'},
+      ),
+      GROUP,
+    );
+    expect(e.aspects?.[qtAspect]).toEqual({
+      data: {
+        query: 'SELECT 1',
+        nlQuery: 'one',
+        intent: 'test',
+        sourceType: 'BIGQUERY',
+      },
+    });
+  });
+
+  test('a non-index concept with no entryType and no frontmatter type is refused', () => {
+    expect(() => conceptToEntry(concept({}), GROUP)).toThrow(ConceptError);
   });
 });

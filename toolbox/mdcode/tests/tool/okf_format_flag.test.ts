@@ -160,11 +160,23 @@ describe('without the flag the existing paths are untouched', () => {
   });
 });
 
-describe('the remaining stub reports not-implemented', () => {
-  // This fails the moment initOkfWorkspace becomes real -- the reminder to
-  // give it a test of its own.
-  test('returns a non-zero exit code', async () => {
-    const manifest = {source: {name: 'test-project.us.kb'}} as any;
+describe('initOkfWorkspace scaffolds catalog.yaml and bundle/index.md', () => {
+  test('writes catalog.yaml and bundle/index.md and returns 0', async () => {
+    const manifest = {
+      source: {type: 'entryGroup', name: 'test-project.us.kb'},
+    } as any;
+
+    expect(await initOkfMod.initOkfWorkspace(CTX, manifest, {pull: false})).toBe(0);
+    expect(fs.readFileSync(path.join(dir, 'catalog.yaml'), 'utf8')).toContain(
+      'entryGroup.test-project.us.kb',
+    );
+    expect(
+      fs.readFileSync(path.join(dir, 'bundle', 'index.md'), 'utf8'),
+    ).toContain('okf_version: "0.2"');
+  });
+
+  test('returns 1 on a malformed scope name', async () => {
+    const manifest = {source: {name: 'bad-scope'}} as any;
 
     expect(await initOkfMod.initOkfWorkspace(CTX, manifest)).toBe(1);
   });

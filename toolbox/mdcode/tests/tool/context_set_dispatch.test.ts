@@ -114,6 +114,15 @@ describe('pull', () => {
 });
 
 describe('push', () => {
+  test('pushes the OKF bundle when the context set has no semantic model file', async () => {
+    const bundle = spyOn(okfToCatalogMod, 'okfToCatalog')
+                       .mockImplementation(async () => 0);
+
+    expect(await push({})).toBe(0);
+    expect(bundle).toHaveBeenCalledTimes(1);
+    expect(bundle.mock.calls[0][2]).toEqual({validateOnly: undefined});
+  });
+
   // The model leg's checks can reject the whole command, so failing before
   // the bundle's batches go out leaves less half-applied.
   test('does not push the bundle when the model leg fails', async () => {

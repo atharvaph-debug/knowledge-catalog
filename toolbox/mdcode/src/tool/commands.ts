@@ -9,12 +9,14 @@ import * as yaml from 'yaml';
 import * as kcmd from '../libts';
 import {BigQueryClient} from '../libts/gcp/bigquery';
 import * as context from '../libts/gcp/context';
+import * as crm from '../libts/gcp/crm';
 import * as dataplex from '../libts/gcp/dataplex';
 import {SpannerClient} from '../libts/gcp/spanner';
 import {fileNameOf, SemanticModelLayout} from '../libts/layouts/semantic-model';
 import {SplitLayout} from '../libts/layouts/split';
 import {BUNDLE_DIR, CATALOG_DIR} from '../libts/okf/bundle';
 import {catalogToOkf} from '../libts/okf/catalog_to_okf';
+import {fileContentToConcept} from '../libts/okf/concept';
 import {initOkfWorkspace} from '../libts/okf/init_okf_workspace';
 import {okfToCatalog} from '../libts/okf/okf_to_catalog';
 import {SplitSource} from '../libts/sources/split';
@@ -319,12 +321,44 @@ export async function init(options: InitOptions): Promise<number> {
   const ctx = context.ApiContext.default();
 
   let manifest: kcmd.CatalogManifest;
-  if (options.entryGroup) {
-    manifest =
-        await kcmd.CatalogManifest.initWithEntryGroup(options.entryGroup, ctx);
-  } else if (options.kb) {
-    manifest =
-        await kcmd.CatalogManifest.initWithKnowledgeBase(options.kb, ctx);
+  let okfRemoteExists = true;
+  if (options.entryGroup || options.kb) {
+    const scopeName = (options.entryGroup || options.kb)!;
+    const isKb = Boolean(options.kb && !options.entryGroup);
+    try {
+      manifest = isKb
+        ? await kcmd.CatalogManifest.initWithKnowledgeBase(scopeName, ctx)
+        : await kcmd.CatalogManifest.initWithEntryGroup(scopeName, ctx);
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      const parts = scopeName.split('.');
+      if (
+        okf &&
+        msg.includes('Failed to locate EntryGroup') &&
+        parts.length === 3 &&
+        parts.every((p) => Boolean(p))
+      ) {
+        okfRemoteExists = false;
+        const scopePrefix = isKb ? Sources.KB : Sources.ENTRYGROUP;
+        manifest = {
+          source: {
+            type: scopePrefix,
+            name: scopeName,
+            ingestedEntries: false,
+            async *entries() {},
+          },
+          save(filePath: string) {
+            fs.writeFileSync(
+              filePath,
+              yaml.stringify({scope: `${scopePrefix}.${scopeName}`}),
+              'utf8',
+            );
+          },
+        } as unknown as kcmd.CatalogManifest;
+      } else {
+        throw err;
+      }
+    }
   } else if (options.bigqueryDataset) {
     let datasets = '';
     if (Array.isArray(options.bigqueryDataset)) {
@@ -356,6 +390,7 @@ export async function init(options: InitOptions): Promise<number> {
   }
 
   if (okf) {
+    (manifest as any).okfRemoteExists = okfRemoteExists;
     return await initOkfWorkspace(ctx, manifest, {pull: options.pull});
   }
 
@@ -1042,18 +1077,243 @@ async function pushErrors(
   return errors;
 }
 
+const EG_DESCRIPTION_MAX_CHARS = 1024;
+const EG_DISPLAY_NAME_MAX_CHARS = 500;
+
+function extractOkfRootMetadata(
+  basePath: string,
+  project: string,
+  location: string,
+  groupId: string,
+): {displayName?: string; description?: string; overviewContent?: string} {
+  const manifestPath = path.join(basePath, 'catalog.yaml');
+  const rawManifest = fs.existsSync(manifestPath)
+    ? (yaml.parse(fs.readFileSync(manifestPath, 'utf8')) ?? {})
+    : {};
+  let displayName =
+    typeof rawManifest.displayName === 'string' && rawManifest.displayName.trim()
+      ? rawManifest.displayName.trim()
+      : undefined;
+  let description =
+    typeof rawManifest.description === 'string' && rawManifest.description.trim()
+      ? rawManifest.description.trim()
+      : undefined;
+  let overviewContent: string | undefined;
+
+  const bundleRoot = path.join(basePath, 'bundle');
+  const candidates = [
+    path.join(bundleRoot, `${groupId}_entry.md`),
+    path.join(bundleRoot, groupId, project, location, `${groupId}_entry.md`),
+    path.join(bundleRoot, 'agents.md'),
+    path.join(bundleRoot, groupId, project, location, 'agents.md'),
+    path.join(bundleRoot, 'index.md'),
+  ];
+  for (const cand of candidates) {
+    if (!fs.existsSync(cand)) continue;
+    try {
+      const concept = fileContentToConcept(
+        fs.readFileSync(cand, 'utf8'),
+        path.basename(cand, '.md'),
+      );
+      const fmTitle =
+        typeof concept.frontmatter['title'] === 'string'
+          ? concept.frontmatter['title'].trim()
+          : '';
+      const fmDesc =
+        typeof concept.frontmatter['description'] === 'string'
+          ? concept.frontmatter['description'].trim()
+          : '';
+      const bodyClean = concept.body
+        .replace(/\n*##\s+OKF\s+Metadata\b[\s\S]*$/i, '')
+        .trim();
+      const h1Match = bodyClean.match(/^#\s+(.+?)\s*$/m);
+      const headingTitle = h1Match?.[1]?.trim() ?? '';
+      const firstPara = bodyClean
+        .split(/\n\s*\n/)
+        .map((p) => p.trim())
+        .find((p) => p && !/^([#*|-]|\d+\.)/.test(p));
+      if (!displayName && (fmTitle || headingTitle)) {
+        displayName = fmTitle || headingTitle;
+      }
+      if (!description && (fmDesc || firstPara)) {
+        description = (fmDesc || firstPara || '').replace(/\s+/g, ' ').trim();
+      }
+      if (!overviewContent && bodyClean) {
+        overviewContent = bodyClean;
+      }
+    } catch {
+      // Ignore unparseable candidate here; okfToCatalog reports concept errors.
+    }
+  }
+  if (displayName) {
+    displayName = displayName.slice(0, EG_DISPLAY_NAME_MAX_CHARS);
+  }
+  if (description) {
+    description = description.slice(0, EG_DESCRIPTION_MAX_CHARS);
+  }
+  return {displayName, description, overviewContent};
+}
+
 export async function push(options: PushOptions): Promise<number> {
   const okf = okfSelected(options, 'push');
 
   const ctx = context.ApiContext.default();
-  const snapshot = await kcmd.CatalogSnapshot.fromPath('.', ctx);
 
   if (okf) {
-    return await okfToCatalog(ctx, snapshot, {validateOnly: options.validateOnly});
+    let snapshot: kcmd.CatalogSnapshot;
+    let createdEg = false;
+    try {
+      snapshot = await kcmd.CatalogSnapshot.fromPath('.', ctx);
+    } catch (err: any) {
+      const msg = String(err?.message || err);
+      const rawScope = fs.existsSync('catalog.yaml')
+        ? yaml.parse(fs.readFileSync('catalog.yaml', 'utf8'))?.scope
+        : undefined;
+      const scopeStr =
+        typeof rawScope === 'string'
+          ? rawScope.replace(/^(entryGroup|kb)\./, '')
+          : '';
+      const [project, location, groupId] = scopeStr.split('.');
+      if (
+        !msg.includes('Failed to locate EntryGroup') ||
+        !project ||
+        !location ||
+        !groupId
+      ) {
+        throw err;
+      }
+      if (options.validateOnly) {
+        snapshot = {
+          basePath: '.',
+          manifest: {
+            source: {
+              name: `${project}.${location}.${groupId}`,
+              async *entries() {},
+            },
+          },
+        } as any;
+      } else {
+        const rootMeta = extractOkfRootMetadata('.', project, location, groupId);
+        const catalog = new dataplex.CatalogClient(ctx);
+        const createRes = await catalog.createEntryGroup(
+          project,
+          location,
+          groupId,
+          {
+            type: 'context-set',
+            ...(rootMeta.displayName ? {displayName: rootMeta.displayName} : {}),
+            ...(rootMeta.description ? {description: rootMeta.description} : {}),
+          } as any,
+        );
+        if (createRes.status !== 200 && createRes.status !== 409) {
+          throw err;
+        }
+        if ((createRes.result as any)?.name?.includes('/operations/')) {
+          await catalog.awaitOperation(
+            createRes.result as any,
+            'createEntryGroup',
+          );
+        }
+        createdEg = true;
+        snapshot = await kcmd.CatalogSnapshot.fromPath('.', ctx);
+      }
+    }
+    const [project, location, groupId] = snapshot.manifest.source.name.split('.');
+    const rootMeta = extractOkfRootMetadata(
+      snapshot.basePath || '.',
+      project,
+      location,
+      groupId,
+    );
+    if (!options.validateOnly && !createdEg && (rootMeta.displayName || rootMeta.description)) {
+      const catalog = new dataplex.CatalogClient(ctx);
+      const egRes = await catalog.getEntryGroup(project, location, groupId);
+      if (egRes.status === 200 && egRes.result) {
+        const patchBody: Record<string, any> = {};
+        const updateMask: string[] = [];
+        if (
+          rootMeta.displayName &&
+          egRes.result.displayName !== rootMeta.displayName
+        ) {
+          patchBody.displayName = rootMeta.displayName;
+          updateMask.push('displayName');
+        }
+        if (
+          rootMeta.description &&
+          egRes.result.description !== rootMeta.description
+        ) {
+          patchBody.description = rootMeta.description;
+          updateMask.push('description');
+        }
+        if (updateMask.length) {
+          const patchRes = await catalog.updateEntryGroup(
+            project,
+            location,
+            groupId,
+            patchBody,
+            updateMask,
+          );
+          if (patchRes.status === 200 && patchRes.result?.name?.includes('/operations/')) {
+            await catalog.awaitOperation(patchRes.result, 'updateEntryGroup');
+          }
+        }
+      }
+    }
+    const code = await okfToCatalog(ctx, snapshot, {
+      validateOnly: options.validateOnly,
+    });
+    if (code === 0 && !options.validateOnly && rootMeta.overviewContent) {
+      const catalog = new dataplex.CatalogClient(ctx);
+      const pnum = await crm.projectNumber(project, ctx);
+      const repCandidates: string[] = [];
+      if (pnum) {
+        repCandidates.push(
+          `projects/${project}/locations/${location}/entryGroups/@dataplex/entries/` +
+            `projects/${pnum}/locations/${location}/entryGroups/${groupId}`,
+        );
+      }
+      repCandidates.push(
+        `projects/${project}/locations/${location}/entryGroups/${groupId}/entries/${groupId}_entry`,
+      );
+      const ovKey = 'dataplex-types.global.overview';
+      const maxAttempts = createdEg ? 5 : 2;
+      let patchedRep = false;
+      for (let attempt = 0; attempt < maxAttempts && !patchedRep; attempt++) {
+        for (const repName of repCandidates) {
+          const res = await catalog.updateEntry(
+            {
+              name: repName,
+              entryType:
+                'projects/dataplex-types/locations/global/entryTypes/entrygroup',
+              aspects: {
+                [ovKey]: {
+                  data: {
+                    content: rootMeta.overviewContent,
+                    contentType: 'MARKDOWN',
+                  },
+                },
+              },
+            },
+            ['aspects'],
+            [ovKey],
+          );
+          if (res.status === 200) {
+            patchedRep = true;
+            break;
+          }
+        }
+        if (!patchedRep && attempt < maxAttempts - 1) {
+          await new Promise((r) => setTimeout(r, 600));
+        }
+      }
+    }
+    return code;
   }
 
-  // A context set pushes its model exactly as a semantic-model scope does,
-  // then its OKF bundle.
+  const snapshot = await kcmd.CatalogSnapshot.fromPath('.', ctx);
+
+  // A context set pushes its model (when one exists) as a semantic-model scope
+  // does, then its OKF bundle.
   const contextSet = snapshot.manifest.source.type === Sources.CONTEXT_SET;
   if (snapshot.manifest.source.type === Sources.SEMANTIC_MODEL || contextSet) {
     // The semantic-model source always resolves to the SemanticModel layout
@@ -1090,6 +1350,13 @@ export async function push(options: PushOptions): Promise<number> {
     }
 
     const layoutDocs = layout.modelDocuments();
+    // A context set with no semantic model documents in catalog/EntryGroups/<group>/
+    // is an OKF-only context set: skip the model leg and push the bundle directly.
+    if (contextSet && !layoutDocs.length && kcEnabled && !allProfiles &&
+        namedProfile === undefined) {
+      return await okfToCatalog(
+          ctx, snapshot, {validateOnly: options.validateOnly});
+    }
     const profileDocs = profileDocsReader(layout);
     const declared = declaredProfilesReader(profileDocs);
     const defaultProject = source.project ?? ctx.project;
