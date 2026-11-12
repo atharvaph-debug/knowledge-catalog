@@ -1,0 +1,80 @@
+name: 'Knowledge Catalog OKF Sync (kcmd)'
+description: 'Validate and push Open Knowledge Format (OKF) bundles to Google Cloud Knowledge Catalog using @google-cloud/kcmd.'
+inputs:
+  subpath:
+    description: 'Relative path inside the repository to search for catalog.yaml workspaces.'
+    required: false
+    default: '.'
+  dry_run:
+    description: 'Set to "true" to validate and show planned changes without mutating Knowledge Catalog.'
+    required: false
+    default: 'false'
+  kcmd_version:
+    description: 'Version of @google-cloud/kcmd on npm (e.g. "0.2.5" or "latest"), or "source" to build from this action repository.'
+    required: false
+    default: '0.2.5'
+  project_id:
+    description: 'Optional GCP project ID override (defaults to project parsed from catalog.yaml scope).'
+    required: false
+    default: ''
+  location:
+    description: 'Optional GCP location override (defaults to location parsed from catalog.yaml scope, or "global").'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Set up Bun (when building kcmd from source)
+      if: inputs.kcmd_version == 'source'
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: '1.3.14'
+
+    - name: Build kcmd from action source
+      if: inputs.kcmd_version == 'source'
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: |
+        npm ci
+        npm run build:libts
+        npm run build:cli
+
+    - name: Run kcmd push across discovered catalog.yaml workspaces
+      shell: bash
+      env:
+        INPUT_SUBPATH: ${{ inputs.subpath }}
+        INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        INPUT_KCMD_VERSION: ${{ inputs.kcmd_version }}
+        INPUT_PROJECT_ID: ${{ inputs.project_id }}
+        INPUT_LOCATION: ${{ inputs.location }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        FLAGS=()
+        if [ "${INPUT_DRY_RUN}" = "true" ]; then
+          FLAGS+=("--dry-run")
+        fi
+        FOUND=0
+        while IFS= read -r -d '' manifest; do
+          FOUND=1
+          ws_dir="$(dirname "${manifest}")"
+          scope_line="$(awk -F': *' '/^scope:/{print $2; exit}' "${manifest}" | tr -d '"' | tr -d "'")"
+          IFS='.' read -r _scope_type scope_proj scope_loc _rest <<< "${scope_line}"
+          export CLOUDSDK_CORE_PROJECT="${INPUT_PROJECT_ID:-${scope_proj:-}}"
+          export CLOUDSDK_COMPUTE_REGION="${INPUT_LOCATION:-${scope_loc:-global}}"
+          echo "Running kcmd push ${FLAGS[*]:-} in ${ws_dir} (project=${CLOUDSDK_CORE_PROJECT}, region=${CLOUDSDK_COMPUTE_REGION})..."
+          if [ "${INPUT_KCMD_VERSION}" = "source" ]; then
+            (cd "${ws_dir}" && node "${ACTION_PATH}/build/ts/kcmd/cli.js" push "${FLAGS[@]}")
+          else
+            (cd "${ws_dir}" && npx --yes "@google-cloud/kcmd@${INPUT_KCMD_VERSION}" push "${FLAGS[@]}")
+          fi
+        done < <(find "${INPUT_SUBPATH}" -name "catalog.yaml" -print0)
+        if [ "${FOUND}" -eq 0 ]; then
+          echo "No catalog.yaml found under '${INPUT_SUBPATH}'; skipping kcmd push."
+        fi

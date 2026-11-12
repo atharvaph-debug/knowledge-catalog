@@ -217,6 +217,17 @@ The server offers the following tools:
 
 NOTE: The server uses `gcloud` to obtain authentication tokens, so ensure you are authenticated via `gcloud auth application-default login`.
 
+### GitHub Actions CI/CD Integration (Git-Governed Publishing)
+
+To automatically validate Open Knowledge Format (`layout: okf`) pull requests with `kcmd push --dry-run` and publish merged changes on `main` to Knowledge Catalog via `kcmd push`:
+
+1. **Configure Workload Identity Federation (WIF) in your Google Cloud project:**
+   Grant your repository's OIDC principal `roles/iam.workloadIdentityUser` on the Service Account that holds `roles/dataplex.catalogEditor` on your target EntryGroup.
+2. **Set Repository Variables in GitHub (`Settings -> Secrets and variables -> Actions -> Variables`):**
+   - `GCP_WORKLOAD_IDENTITY_PROVIDER`: `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL_ID>/providers/<PROVIDER_ID>`
+   - `GCP_SERVICE_ACCOUNT`: `<SERVICE_ACCOUNT_NAME>@<PROJECT_ID>.iam.gserviceaccount.com`
+3. **Copy [`workflows/kc-sync.yml`](workflows/kc-sync.yml) to `.github/workflows/kc-sync.yml` in your repository** (or invoke the composite action [`action.yml`](action.yml) directly via `uses: GoogleCloudPlatform/knowledge-catalog/toolbox/mdcode@main`).
+
 ## Developer Workflow
 
 ### Setup
